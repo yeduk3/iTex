@@ -1,0 +1,24 @@
+// VS Code settings.json — register iTex as a LaTeX Workshop build recipe.
+// Tool shape {name, command, args?, env?, cwd?} and recipe→tool-name reference verified against
+// LaTeX Workshop's package.json schema (docs/appendix). %DOC% / %OUTDIR% are LaTeX Workshop placeholders.
+{
+  "latex-workshop.latex.tools": [
+    {
+      "name": "itex-xelatex",
+      "command": "itex",
+      "args": ["compile", "--engine", "xelatex", "-synctex=1", "-outdir=%OUTDIR%", "%DOC%"]
+    },
+    {
+      "name": "itex-draft-preview",
+      "command": "itex",
+      "args": ["compile", "--engine", "xelatex", "--draft", "-synctex=1", "-outdir=%OUTDIR%", "%DOC%"]
+    }
+  ],
+  "latex-workshop.latex.recipes": [
+    { "name": "iTex (xelatex)",      "tools": ["itex-xelatex"] },
+    { "name": "iTex (draft preview)", "tools": ["itex-draft-preview"] }
+  ],
+  // SyncTeX forward/inverse work out of the box because itex emits %DOC%.synctex.gz.
+  "latex-workshop.view.pdf.viewer": "tab",
+  "latex-workshop.latex.autoBuild.run": "onSave"
+}

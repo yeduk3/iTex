@@ -1,0 +1,44 @@
+name: iTex
+options:
+  bundleIdPrefix: com.gyu
+  xcodeVersion: "15"
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    PRODUCT_NAME: iTex
+
+targets:
+  iTex-macOS:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gyu.iTex
+        INFOPLIST_FILE: Sources/Info-macOS.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+  iTex-iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+    resources:
+      - path: Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gyu.iTex
+        INFOPLIST_FILE: Sources/Info-iOS.plist
+        TARGETED_DEVICE_FAMILY: "2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -1,0 +1,21 @@
+[package]
+name = "itex_tectonic"
+version = "0.1.0"
+edition = "2021"
+description = "Thin C-FFI over the Tectonic engine so iTex can compile LaTeX in-process (docs/03 §3.7, docs/04 §4.1). This is the only path that compiles on iOS, where Process spawning is forbidden."
+
+[lib]
+name = "itex_tectonic"
+# staticlib → links into the iTex app / an XCFramework. cdylib is unused on Apple platforms.
+crate-type = ["staticlib"]
+
+[dependencies]
+# Tectonic = MIT. Engine + xdvipdfmx exposed as a Rust crate (V1 latex_to_pdf, V2 driver).
+# NOTE: not hermetic — needs a TeXLive bundle + format file. By default fetched over the network
+# on first run and cached in TECTONIC_CACHE_DIR; for iOS ship a local bundle (see README).
+# The crates.io tectonic 0.15.0 release has cranko placeholder version pins → Cargo resolves
+# drifted/bit-rotted sub-crates (E0432/E0050/E0609, app_dirs2 API gone). The git workspace
+# pins all tectonic_* crates in lockstep, so build from a tagged commit instead.
+# external-harfbuzz: link system harfbuzz (brew) instead of the vendored submodule, whose 0.2.9
+# build.rs has a header-copy bug. macOS host build only; iOS uses vendored via the XCFramework script.
+tectonic = { git = "https://github.com/tectonic-typesetting/tectonic", tag = "tectonic@0.15.0", features = ["external-harfbuzz"] }

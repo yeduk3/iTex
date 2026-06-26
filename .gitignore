@@ -1,0 +1,35 @@
+# Xcode
+# .xcodeproj is generated from project.yml by `xcodegen generate`
+*.xcodeproj/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Build artifacts
+build/
+
+# iTex
+.create-product/
+
+# Rust (tectonic-ffi)
+tectonic-ffi/target/
+# Generated build artifacts in source dirs (warm format, body, image proxies)
+.itex-fmt-*
+.itex-body-*

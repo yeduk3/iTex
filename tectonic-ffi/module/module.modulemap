@@ -1,0 +1,5 @@
+module CItexTectonic {
+    header "../include/itex_tectonic.h"
+    link "itex_tectonic"
+    export *
+}

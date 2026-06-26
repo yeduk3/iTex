@@ -1,0 +1,9 @@
+# .latexmkrc — make latexmk drive the iTex engine.
+# Copy to your project root as `.latexmkrc` (or ~/.latexmkrc for all projects).
+# Any editor that builds via `latexmk` then routes through itex, which emits PDF + .synctex.gz.
+#
+# itex resolves the engine itself; here we just hand it the source file. %S = source, %O = options.
+$pdf_mode = 1;
+$pdflatex = 'itex compile --engine xelatex -synctex=1 %O %S';
+# For a fast draft preview loop instead, use:
+# $pdflatex = 'itex compile --engine xelatex --draft -synctex=1 %O %S';

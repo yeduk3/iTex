@@ -1,0 +1,21 @@
+# texlab build config — point texlab's `textDocument/build` at the iTex engine.
+# texlab is GPL-3.0; we integrate via its external-build config, not by forking (docs/05 §C).
+#
+# Neovim (lua) equivalent:
+#   require('lspconfig').texlab.setup{ settings = { texlab = { build = {
+#     executable = 'itex',
+#     args = { 'compile', '--engine', 'xelatex', '-synctex=1', '-outdir=%OUTDIR%', '%f' },
+#     onSave = true,
+#     forwardSearchAfter = true,
+#   }}}}
+#
+# Generic LSP settings.texlab.build:
+[build]
+executable = "itex"
+args = ["compile", "--engine", "xelatex", "-synctex=1", "%f"]
+on_save = true
+forward_search_after = true
+
+# Inverse search: texlab's forwardSearch/SyncTeX relies on the .synctex.gz itex emits.
+[forward_search]
+# e.g. Skim / Sioyek / Zathura — viewer-specific; itex's job is only to produce .synctex.gz.
