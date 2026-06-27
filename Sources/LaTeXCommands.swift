@@ -5,6 +5,24 @@ enum LaTeXCommands {
         return all.filter { $0.hasPrefix(p) }.sorted()
     }
 
+    // Environments offered as `\name` in command-context completion, then wrappable with Tab.
+    static let environments: [String] = [
+        "itemize", "enumerate", "description",
+        "figure", "table", "tabular", "tabularx", "longtable", "wrapfigure",
+        "equation", "align", "alignat", "gather", "multline", "cases", "split",
+        "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix", "smallmatrix",
+        "center", "flushleft", "flushright", "quote", "quotation", "verse",
+        "verbatim", "lstlisting", "minipage", "frame", "abstract", "array",
+        "theorem", "lemma", "proof", "definition", "proposition",
+        "corollary", "remark", "example", "document", "thebibliography",
+    ]
+
+    // texlab has no completion inside [] — supply common key=value option keys ourselves.
+    static let optionKeys: [String] = [
+        "width=", "height=", "scale=", "angle=", "trim=", "clip", "keepaspectratio",
+        "draft", "page=", "totalheight=", "origin=", "viewport=",
+    ]
+
     static let all: [String] = [
         // Structure
         "\\documentclass", "\\usepackage", "\\begin", "\\end",

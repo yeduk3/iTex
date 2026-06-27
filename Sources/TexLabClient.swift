@@ -166,7 +166,11 @@ final class TexLabClient {
         }
         return arr?.compactMap { item in
             guard let label = item["label"] as? String else { return nil }
-            let insert = (item["insertText"] as? String ?? label)
+            // texlab never sends insertText — it uses textEdit.newText (backslash-stripped for commands).
+            let raw = (item["insertText"] as? String)
+                ?? ((item["textEdit"] as? [String: Any])?["newText"] as? String)
+                ?? label
+            let insert = raw
                 .replacingOccurrences(of: "${0}", with: "")  // strip snippet placeholders
                 .replacingOccurrences(of: "\\$\\{\\d+\\}", with: "", options: .regularExpression)
             return (label: label, insertText: insert)

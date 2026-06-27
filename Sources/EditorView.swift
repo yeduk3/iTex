@@ -6,31 +6,24 @@ struct EditorView: View {
     let linter: ChkTexLinter
     var texLabClient: TexLabClient?
 
-    var body: some View {
-        VStack(spacing: 0) {
-            if let msg = compiler.errorMessage {
-                banner(msg, color: .red)
-            }
-            LaTeXEditorView(text: $source, texLabClient: texLabClient, compiler: compiler)
-                .onChange(of: source) { _, new in
-                    compiler.scheduleCompile(source: new)
-                    linter.scheduleLint(fileURL: compiler.fileURL)
-                    texLabClient?.changeDocument(text: new)
-                }
+    /// Compile-failure messages + chktex errors, keyed by source line.
+    private var mergedErrors: [Int: String] {
+        var m = compiler.errorMessages
+        for w in linter.warnings where w.isError {
+            m[w.line] = m[w.line].map { $0 + "\n" + w.message } ?? w.message
         }
+        return m
     }
 
-    private func banner(_ message: String, color: Color) -> some View {
-        ScrollView(.vertical) {
-            Text(message)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(color)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-        }
-        .frame(maxHeight: 90)
-        .background(color.opacity(0.07))
-        .overlay(alignment: .bottom) { Divider() }
+    var body: some View {
+        // Errors surface inline (red line + hover/⌘. popover). Full-message banner removed
+        // — compiler.errorMessage kept for a future dedicated panel.
+        LaTeXEditorView(text: $source, texLabClient: texLabClient, compiler: compiler,
+                        errorMessages: mergedErrors,
+                        selectReq: compiler.selectLineRequest, scrollReq: compiler.scrollToLineRequest)
+            .onChange(of: source) { _, new in
+                // Keep the LSP in sync live (completions need it); compile/lint moved to save.
+                texLabClient?.changeDocument(text: new)
+            }
     }
 }

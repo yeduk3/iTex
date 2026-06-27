@@ -20,8 +20,8 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources
-    resources:
       - path: Resources
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gyu.iTex
@@ -34,8 +34,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
-    resources:
       - path: Resources
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gyu.iTex

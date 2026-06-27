@@ -24,6 +24,10 @@ if cmd == "--selfcheck" {
     await runSelfcheck()
     exit(0)
 }
+if cmd == "--warmbench" {
+    await runWarmBench(Array(argv.dropFirst()))
+    exit(0)
+}
 guard cmd == "compile" else { usage() }
 
 // MARK: - parse latexmk-ish flags leniently

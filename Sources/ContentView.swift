@@ -32,7 +32,17 @@ struct ContentView: View {
             .onChange(of: fileURL) { _, url in
                 compiler.fileURL = url
             }
-            .onDisappear { texLabClient.stop() }
+            .onReceive(NotificationCenter.default.publisher(for: .iTexDidSave)) { _ in
+                // Compile-on-save (replaces per-keystroke compile).
+                Task { await compiler.compile(source: document.source, profile: .fastPreview) }
+                if let url = fileURL { Task { await linter.lint(fileURL: url) } }
+            }
+            .onDisappear {
+                texLabClient.stop()
+#if os(macOS)
+                Task { await compiler.shutdownWarm() }
+#endif
+            }
     }
 
     @ViewBuilder
@@ -59,14 +69,6 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .automatic) {
-            Picker("Engine", selection: $compiler.engine) {
-                ForEach(TexEngine.allCases) { e in Text(e.label).tag(e) }
-            }
-            .pickerStyle(.segmented)
-            .fixedSize()
-            .help("LaTeX engine")
-        }
-        ToolbarItem(placement: .automatic) {
             if !linter.warnings.isEmpty {
                 let errors   = linter.warnings.filter(\.isError).count
                 let warnings = linter.warnings.filter { !$0.isError }.count
@@ -83,7 +85,15 @@ struct ContentView: View {
             Button { Task { await compiler.forwardSearch() } }
                 label: { Label("Sync", systemImage: "scope") }
                 .keyboardShortcut("j", modifiers: [.command])
-                .help("SyncTeX: jump to cursor in PDF (⌘J). ⌘-click the PDF for reverse.")
+                .help("SyncTeX: jump to cursor in PDF, centered (⌘J). ⌘-click the PDF for reverse.")
+        }
+        ToolbarItem(placement: .automatic) {
+            Button { compiler.scrollSyncEnabled.toggle() } label: {
+                Label("Scroll Sync", systemImage: compiler.scrollSyncEnabled
+                      ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down.circle")
+            }
+            .help("Scroll sync: keep the editor and PDF viewport centers aligned (bidirectional)")
+            .foregroundStyle(compiler.scrollSyncEnabled ? Color.accentColor : Color.primary)
         }
 #endif
         ToolbarItem(placement: .automatic) {

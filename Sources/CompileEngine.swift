@@ -34,7 +34,7 @@ func stableHash(_ s: String) -> String {
 // MARK: - Subprocess helper (drains pipe concurrently to avoid >64KB deadlock)
 
 /// Thread-safe byte accumulator for draining a subprocess pipe off the reader thread.
-final class OutputSink {
+final class OutputSink: @unchecked Sendable {   // NSLock-guarded → safe across the drain threads
     private let lock = NSLock()
     private var data = Data()
     func append(_ d: Data) { lock.lock(); data.append(d); lock.unlock() }
@@ -105,6 +105,114 @@ struct LatexmkBackend: CompileBackend {
         }
         let synURL = FileManager.default.fileExists(atPath: syn.path) ? syn : nil
         return CompileResult(pdfURL: pdf, synctexURL: synURL, log: r.output)
+    }
+}
+
+// MARK: - Warm pre-started engine (docs/03 §3.3) — the all-engine fast-preview path
+//
+// The .fmt backend below is pdflatex-only by nature: XeTeX hard-refuses `\dump` once a native
+// font is live ("Can't \dump a format with native fonts"), and LuaTeX can't serialize luaotfload
+// Lua state. So fontspec / Korean (kotex/xeCJK) / lualatex docs cannot get a warm .fmt at all.
+//
+// This actor reuses the tex-fast-recompile technique instead (vendored Resources/fastrecompile.sty,
+// LPPL 1.3c): keep ONE live engine process parked at \begin{document}, blocked on a terminal read,
+// with the whole preamble + OpenType fonts already loaded in RAM. On the next save we write the
+// build-copy path to its stdin; the .sty re-\inputs that file, gobbles the preamble lines, and
+// typesets only the body on top of the warm state. Fonts live in the process — never serialized —
+// so this works identically for pdflatex / xelatex / lualatex. It also emits real SyncTeX every
+// recompile (unlike the .fmt path, which returns nil), because it \inputs the real build copy.
+//
+// errorstopmode is mandatory: the .sty's terminal \read returns EOF under -interaction=nonstopmode,
+// so we pass NO -interaction flag and close stdin after feeding (a body error then EOF-exits instead
+// of hanging). Single-pass → cross-refs can be one compile stale; ⌘B finalCompile (latexmk
+// rerun+biber) stays the correctness backstop. Each warm process serves exactly one compile, then
+// is killed and a fresh one is armed for the next edit (preamble pass amortized into idle time).
+actor WarmEngine {
+    private var proc: Process?
+    private var stdinHandle: FileHandle?
+    private var outHandle: FileHandle?
+    private var sink: OutputSink?
+    private var armedKey: String?
+
+    private func key(_ engine: TexEngine, _ preambleHash: String, _ tex: URL) -> String {
+        "\(engine.rawValue)|\(preambleHash)|\(tex.path)"
+    }
+
+    /// Spawn a fresh engine that loads the preamble of `buildTex` and parks at \begin{document}.
+    /// Kills any previously parked process first. No-op result on launch failure (warm unavailable).
+    func arm(buildTex: URL, engine: TexEngine, preambleHash: String, workingDir: URL, resources: String) {
+        kill()
+        let job = buildTex.deletingPathExtension().lastPathComponent
+        // Inject graphicx draft BEFORE the preamble loads → images become labelled boxes, skipping
+        // decode/embed (docs/03 §3.4). This is the warm equivalent of latexmk's -usepretex draft;
+        // warm only runs for fastPreview, so it always applies. \PassOptionsToPackage is a no-op
+        // (harmless "unused option" note) if the doc never loads graphicx.
+        // ponytail: \input{abspath} via braces tolerates spaces; a path with %, \, { } would break
+        // the wrapper → the parked engine errors → tryCompile gets no PDF → latexmk fallback. Fine.
+        let wrapper = #"\PassOptionsToPackage{draft}{graphicx}\RequirePackage{fastrecompile}\fastrecompilecheckversion{0.5.0}\fastrecompilesetimplicitpreamble\input{"# + buildTex.path + "}"
+
+        let p = Process()
+        p.executableURL = URL(filePath: "/usr/bin/env")
+        p.currentDirectoryURL = workingDir
+        // No -interaction flag: errorstopmode is required for the .sty's terminal \read.
+        p.arguments = [engine.rawValue, "-synctex=1", "-file-line-error",
+                       "-jobname=" + job, "-output-directory=" + workingDir.path, wrapper]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = Subprocess.texPATH + ":" + (env["PATH"] ?? "")
+        env["TEXINPUTS"] = resources + ":" + (env["TEXINPUTS"] ?? "")   // find vendored fastrecompile.sty
+        p.environment = env
+
+        let inPipe = Pipe(), outPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = outPipe
+        p.standardError = outPipe
+        let out = outPipe.fileHandleForReading
+        let sink = OutputSink()
+        // Drain the preamble pass's output while parked, so a chatty preamble can't fill the pipe.
+        out.readabilityHandler = { fh in let d = fh.availableData; if !d.isEmpty { sink.append(d) } }
+
+        do { try p.run() } catch { return }   // warm unavailable; armedKey stays nil → caller uses latexmk
+        proc = p
+        stdinHandle = inPipe.fileHandleForWriting
+        outHandle = out
+        self.sink = sink
+        armedKey = key(engine, preambleHash, buildTex)
+    }
+
+    /// Feed the body to the parked engine and await the PDF. Returns nil (→ caller falls back to
+    /// latexmk) if nothing is armed, the preamble/engine changed, the process died, or no PDF resulted.
+    func tryCompile(buildTex: URL, engine: TexEngine, preambleHash: String, workingDir: URL) async -> CompileResult? {
+        guard let p = proc, let sin = stdinHandle, let out = outHandle, let sink = sink,
+              p.isRunning, armedKey == key(engine, preambleHash, buildTex)
+        else { return nil }
+        // Consume: this parked process serves exactly one compile.
+        proc = nil; stdinHandle = nil; outHandle = nil; self.sink = nil; armedKey = nil
+
+        let path = buildTex.path
+        let status: Int32 = await withCheckedContinuation { cont in
+            DispatchQueue.global().async {
+                do { try sin.write(contentsOf: Data((path + "\n").utf8)) } catch {}
+                try? sin.close()                 // close → a body error hits EOF and exits, no hang
+                p.waitUntilExit()                // returns immediately if already exited (no handler race)
+                out.readabilityHandler = nil
+                if let d = try? out.readToEnd(), !d.isEmpty { sink.append(d) }
+                cont.resume(returning: p.terminationStatus)
+            }
+        }
+
+        let base = buildTex.deletingPathExtension().lastPathComponent
+        let pdf = workingDir.appending(path: base + ".pdf")
+        let syn = workingDir.appending(path: base + ".synctex.gz")
+        guard status == 0, FileManager.default.fileExists(atPath: pdf.path) else { return nil }
+        let synURL = FileManager.default.fileExists(atPath: syn.path) ? syn : nil
+        return CompileResult(pdfURL: pdf, synctexURL: synURL, log: sink.string())
+    }
+
+    /// Terminate the parked process (document close / app teardown / preamble change).
+    func kill() {
+        if let p = proc, p.isRunning { try? stdinHandle?.close(); p.terminate() }
+        outHandle?.readabilityHandler = nil
+        proc = nil; stdinHandle = nil; outHandle = nil; sink = nil; armedKey = nil
     }
 }
 
