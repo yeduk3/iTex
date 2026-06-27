@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var compiler      = LaTeXCompiler()
     @State private var linter        = ChkTexLinter()
     @State private var texLabClient  = TexLabClient()
+    @State private var shortcuts     = ShortcutStore.shared
 
     var body: some View {
         splitLayout
@@ -84,15 +85,16 @@ struct ContentView: View {
         ToolbarItem(placement: .automatic) {
             Button { Task { await compiler.forwardSearch() } }
                 label: { Label("Sync", systemImage: "scope") }
-                .keyboardShortcut("j", modifiers: [.command])
-                .help("SyncTeX: jump to cursor in PDF, centered (⌘J). ⌘-click the PDF for reverse.")
+                .keyboardShortcut(shortcuts.combo(.forwardSync).keyboardShortcut)
+                .help("SyncTeX: jump to cursor in PDF, centered (\(shortcuts.combo(.forwardSync).display)). ⌘-click the PDF for reverse.")
         }
         ToolbarItem(placement: .automatic) {
             Button { compiler.scrollSyncEnabled.toggle() } label: {
                 Label("Scroll Sync", systemImage: compiler.scrollSyncEnabled
                       ? "arrow.up.arrow.down.circle.fill" : "arrow.up.arrow.down.circle")
             }
-            .help("Scroll sync: keep the editor and PDF viewport centers aligned (bidirectional)")
+            .keyboardShortcut(shortcuts.combo(.scrollSyncToggle).keyboardShortcut)
+            .help("Scroll sync (\(shortcuts.combo(.scrollSyncToggle).display)): keep the editor and PDF viewport centers aligned (bidirectional)")
             .foregroundStyle(compiler.scrollSyncEnabled ? Color.accentColor : Color.primary)
         }
 #endif
@@ -102,8 +104,8 @@ struct ContentView: View {
             } else {
                 Button { Task { await compiler.compile(source: document.source, profile: .finalCompile) } }
                     label: { Label("Build", systemImage: "hammer") }
-                    .keyboardShortcut("b", modifiers: [.command])
-                    .help("Final build: full-res images, rerun-until-stable + biber (⌘B)")
+                    .keyboardShortcut(shortcuts.combo(.build).keyboardShortcut)
+                    .help("Final build: full-res images, rerun-until-stable + biber (\(shortcuts.combo(.build).display))")
             }
         }
     }

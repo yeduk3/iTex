@@ -153,24 +153,29 @@ final class LaTeXTextView: NSTextView {
     private static let listEnvironments: Set<String> = ["itemize", "enumerate", "description"]
     private static let knownEnvironments = Set(LaTeXCommands.environments)
 
-    // ⌘. → error popover. Caught here (not keyDown) because macOS turns ⌘. into Cancel before keyDown.
+    // Editor shortcuts run through ShortcutStore (user-reassignable in Settings). performKeyEquivalent
+    // catches command combos first — needed for ⌘. which macOS turns into Cancel before keyDown.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if !hasMarkedText(), event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers == "." {
-            toggleErrorPopoverAtCursor()
+        if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return true
         }
         return super.performKeyEquivalent(with: event)
     }
 
-    // ⌘/ → toggle line comment
     override func keyDown(with event: NSEvent) {
-        if !hasMarkedText(), event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers == "/" {
-            toggleComment()
+        if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return
         }
         super.keyDown(with: event)
+    }
+
+    /// Run an editor-owned command; false for commands handled elsewhere (build/sync via SwiftUI buttons).
+    private func runEditorCommand(_ cmd: AppCommand) -> Bool {
+        switch cmd {
+        case .toggleComment: toggleComment(); return true
+        case .showError:     toggleErrorPopoverAtCursor(); return true
+        default:             return false
+        }
     }
 
     // Tab: indent selection / wrap `\env` in begin-end / insert 2 spaces
