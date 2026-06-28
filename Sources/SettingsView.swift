@@ -5,9 +5,20 @@ import AppKit
 /// Preferences window (⌘,). Lists every reassignable command with a recorder + reset.
 struct ShortcutSettingsView: View {
     @State private var store = ShortcutStore.shared
+    @AppStorage("previewSplitVertical") private var verticalSplit = false
 
     var body: some View {
         Form {
+            Section {
+                Picker("Editor / Preview layout", selection: $verticalSplit) {
+                    Text("Side by side").tag(false)
+                    Text("Stacked (vertical)").tag(true)
+                }
+                .pickerStyle(.radioGroup)
+            } header: {
+                Text("Layout")
+            }
+
             Section {
                 ForEach(AppCommand.allCases) { cmd in
                     HStack(spacing: 12) {

@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var linter        = ChkTexLinter()
     @State private var texLabClient  = TexLabClient()
     @State private var shortcuts     = ShortcutStore.shared
+    // true = editor/preview stacked top–bottom; false = side by side. Settings ⌘,.
+    @AppStorage("previewSplitVertical") private var verticalSplit = false
 
     var body: some View {
         splitLayout
@@ -49,14 +51,25 @@ struct ContentView: View {
     @ViewBuilder
     private var splitLayout: some View {
 #if os(macOS)
-        HSplitView {
-            EditorView(source: $document.source, compiler: compiler,
-                       linter: linter, texLabClient: texLabClient)
-                .frame(minWidth: 280)
-            PDFPreviewView(compiler: compiler)
-                .frame(minWidth: 280)
+        if verticalSplit {
+            VSplitView {
+                EditorView(source: $document.source, compiler: compiler,
+                           linter: linter, texLabClient: texLabClient)
+                    .frame(minHeight: 200)
+                PDFPreviewView(compiler: compiler)
+                    .frame(minHeight: 200)
+            }
+            .frame(minWidth: 700, minHeight: 500)
+        } else {
+            HSplitView {
+                EditorView(source: $document.source, compiler: compiler,
+                           linter: linter, texLabClient: texLabClient)
+                    .frame(minWidth: 280)
+                PDFPreviewView(compiler: compiler)
+                    .frame(minWidth: 280)
+            }
+            .frame(minWidth: 700, minHeight: 500)
         }
-        .frame(minWidth: 700, minHeight: 500)
 #else
         HStack(spacing: 0) {
             EditorView(source: $document.source, compiler: compiler,
