@@ -52,14 +52,21 @@ struct ContentView: View {
     @ViewBuilder
     private var splitLayout: some View {
 #if os(macOS)
-        HSplitView {
-            if showSidebar, let root = fileURL?.deletingLastPathComponent() {
-                SidebarView(root: root)
-                    .frame(minWidth: 160, idealWidth: 220, maxWidth: 360)
-            }
+        // NavigationSplitView (macOS standard, like qmd): native animated sidebar
+        // reveal/collapse + drag-resize. ⌘\ drives `showSidebar`; the auto toggle is
+        // removed so our single toolbar button owns the shortcut.
+        NavigationSplitView(columnVisibility: Binding(
+            get: { showSidebar ? .all : .detailOnly },
+            set: { showSidebar = ($0 != .detailOnly) }
+        )) {
+            SidebarView(root: fileURL?.deletingLastPathComponent(), currentFile: fileURL)
+                .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
+        } detail: {
             editorPreviewSplit
                 .frame(minWidth: 560)
         }
+        .navigationSplitViewStyle(.balanced)
+        .toolbar(removing: .sidebarToggle)
         .frame(minWidth: 700, minHeight: 500)
 #else
         HStack(spacing: 0) {
@@ -98,7 +105,7 @@ struct ContentView: View {
     private var toolbarContent: some ToolbarContent {
 #if os(macOS)
         ToolbarItem(placement: .navigation) {
-            Button { showSidebar.toggle() } label: {
+            Button { withAnimation(.easeInOut(duration: 0.22)) { showSidebar.toggle() } } label: {
                 Label("Toggle Sidebar", systemImage: "sidebar.left")
             }
             .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
@@ -149,87 +156,180 @@ struct ContentView: View {
 
 #if os(macOS)
 import AppKit
+import CoreServices
 
-private let previewableImageExts: Set<String> =
-    ["png", "jpg", "jpeg", "pdf", "gif", "tiff", "tif", "bmp", "heic"]
+// MARK: - Sidebar (ported from qmd: DisclosureGroup + lazy children + FSEvents watcher)
 
-/// A file/dir in the sidebar tree. `children == nil` ⇒ leaf (file); built eagerly on first show.
-private struct FileNode: Identifiable {
+/// Watches a directory tree via FSEvents and fires `onChange` (coalesced) on any create /
+/// delete / rename / modify under it — including changes from external apps (Finder).
+private final class DirectoryWatcher {
+    private var stream: FSEventStreamRef?
+    private var watchedPath: String?
+    private let onChange: () -> Void
+
+    init(onChange: @escaping () -> Void) { self.onChange = onChange }
+
+    func start(url: URL) {
+        if stream != nil, watchedPath == url.path { return }   // no-op if already watching
+        stop()
+        watchedPath = url.path
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<DirectoryWatcher>.fromOpaque(info).takeUnretainedValue().onChange()
+        }
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                       retain: nil, release: nil, copyDescription: nil)
+        let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
+        guard let stream = FSEventStreamCreate(kCFAllocatorDefault, callback, &ctx,
+            [url.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.2, flags) else { return }
+        self.stream = stream
+        FSEventStreamSetDispatchQueue(stream, .main)
+        FSEventStreamStart(stream)
+    }
+
+    func stop() {
+        guard let stream else { return }
+        FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream)
+        self.stream = nil; watchedPath = nil
+    }
+
+    deinit { stop() }
+}
+
+/// Bumped whenever the watched folder changes on disk so the tree re-reads.
+private final class FileTreeModel: ObservableObject {
+    @Published var version = 0
+    private lazy var watcher = DirectoryWatcher { [weak self] in self?.reload() }
+    func reload() { version &+= 1 }
+    func watch(_ url: URL?) { if let url { watcher.start(url: url) } else { watcher.stop() } }
+}
+
+/// Disclosure state, one source of truth so folders stay expanded across re-reads.
+/// ponytail: in-memory only — resets on relaunch. Persist to UserDefaults if it should survive.
+private final class SidebarExpansion: ObservableObject {
+    static let shared = SidebarExpansion()
+    @Published var expanded: Set<URL> = []
+}
+
+private struct FileEntry: Identifiable {
     let url: URL
-    var children: [FileNode]?
+    let name: String
+    let isDirectory: Bool
     var id: URL { url }
-    var name: String { url.lastPathComponent }
-    var isDir: Bool { children != nil }
-    var isImage: Bool { previewableImageExts.contains(url.pathExtension.lowercased()) }
 
-    // ponytail: built once, no FSEvents watcher — Refresh button rescans. Depth-capped to avoid runaway.
-    static func build(_ url: URL, depth: Int = 0) -> FileNode {
-        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-        guard isDir, depth < 8 else { return FileNode(url: url, children: nil) }
-        let kids = (try? FileManager.default.contentsOfDirectory(
-            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
-        let nodes = kids
-            .map { build($0, depth: depth + 1) }
-            .sorted { a, b in
-                if a.isDir != b.isDir { return a.isDir }          // dirs first
-                return a.name.localizedStandardCompare(b.name) == .orderedAscending
-            }
-        return FileNode(url: url, children: nodes)
+    static let imageExts: Set<String> = ["png", "jpg", "jpeg", "pdf", "gif", "tiff", "tif", "bmp", "heic"]
+    var isImage: Bool { FileEntry.imageExts.contains(url.pathExtension.lowercased()) }
+    var isTex: Bool { url.pathExtension.lowercased() == "tex" }
+
+    static func children(of dir: URL) -> [FileEntry] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .nameKey]
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { return [] }
+        return items.compactMap { url -> FileEntry? in
+            let vals = try? url.resourceValues(forKeys: Set(keys))
+            return FileEntry(url: url, name: vals?.name ?? url.lastPathComponent,
+                             isDirectory: vals?.isDirectory ?? false)
+        }
+        .sorted { a, b in
+            if a.isDirectory != b.isDirectory { return a.isDirectory && !b.isDirectory }   // dirs first
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
     }
 }
 
-/// Left sidebar: a file tree rooted at the open .tex file's directory. Clicking an image previews it.
+/// Left sidebar: native `.sidebar` file tree rooted at the open .tex file's directory.
+/// Folder name is the section header; selecting an image row previews it (same popover style).
 struct SidebarView: View {
-    let root: URL
-    @State private var tree: FileNode?
-    @State private var preview: FileNode?
+    let root: URL?
+    let currentFile: URL?
+    @StateObject private var tree = FileTreeModel()
+    @State private var selection: URL?
+    @State private var preview: FileEntry?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text(root.lastPathComponent).font(.caption).bold().lineLimit(1)
-                Spacer()
-                Button { tree = FileNode.build(root) } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("Refresh")
-            }
-            .padding(.horizontal, 8).padding(.vertical, 6)
-            Divider()
-            List {
-                if let children = tree?.children {
-                    OutlineGroup(children, id: \.id, children: \.children) { node in
-                        row(node)
+        Group {
+            if let root {
+                List(selection: $selection) {
+                    Section(root.lastPathComponent.removingPercentEncoding ?? root.lastPathComponent) {
+                        ForEach(FileEntry.children(of: root)) { entry in
+                            FileRow(entry: entry, currentFile: currentFile, tree: tree)
+                        }
                     }
                 }
-            }
-            .listStyle(.sidebar)
-        }
-        .onAppear { if tree == nil { tree = FileNode.build(root) } }
-        .onChange(of: root) { _, new in tree = FileNode.build(new) }
-        .popover(item: $preview) { node in
-            if let img = NSImage(contentsOf: node.url) {
-                Image(nsImage: img)
-                    .resizable().scaledToFit()
-                    .frame(maxWidth: 360, maxHeight: 360)
-                    .padding(8)
+                .listStyle(.sidebar)
             } else {
-                Text("Cannot preview \(node.name)").padding()
+                ContentUnavailableView("No Folder", systemImage: "folder",
+                    description: Text("Open a .tex file to browse its folder."))
+            }
+        }
+        .onAppear { tree.watch(root); selection = currentFile }
+        .onChange(of: root) { _, new in tree.watch(new) }
+        .onChange(of: currentFile) { _, f in selection = f }
+        // Single click selects; an image selection previews it (reliable where a row
+        // TapGesture gets swallowed by the table's own mouse tracking).
+        .onChange(of: selection) { _, url in
+            guard let url, FileEntry.imageExts.contains(url.pathExtension.lowercased()) else { return }
+            preview = FileEntry(url: url, name: url.lastPathComponent, isDirectory: false)
+        }
+        .popover(item: $preview) { entry in
+            if let img = NSImage(contentsOf: entry.url) {
+                Image(nsImage: img).resizable().scaledToFit()
+                    .frame(maxWidth: 360, maxHeight: 360).padding(8)
+            } else {
+                Text("Cannot preview \(entry.name)").padding()
             }
         }
     }
+}
 
-    @ViewBuilder
-    private func row(_ node: FileNode) -> some View {
-        Label(node.name, systemImage: icon(node))
-            .lineLimit(1)
-            .contentShape(Rectangle())
-            .onTapGesture { if node.isImage { preview = node } }
+private struct FileRow: View {
+    let entry: FileEntry
+    let currentFile: URL?
+    @ObservedObject var tree: FileTreeModel
+    @ObservedObject private var expansion = SidebarExpansion.shared
+    @State private var children: [FileEntry] = []
+
+    private var expandedBinding: Binding<Bool> {
+        Binding(
+            get: { expansion.expanded.contains(entry.url) },
+            set: { if $0 { expansion.expanded.insert(entry.url) } else { expansion.expanded.remove(entry.url) } }
+        )
+    }
+    private func reloadChildrenIfExpanded() {
+        children = expansion.expanded.contains(entry.url) ? FileEntry.children(of: entry.url) : []
+    }
+    private var isCurrent: Bool {
+        currentFile?.standardizedFileURL == entry.url.standardizedFileURL
     }
 
-    private func icon(_ node: FileNode) -> String {
-        if node.isDir { return "folder" }
-        if node.isImage { return "photo" }
-        if node.url.pathExtension.lowercased() == "tex" { return "doc.text" }
-        return "doc"
+    var body: some View {
+        if entry.isDirectory {
+            DisclosureGroup(isExpanded: expandedBinding) {
+                ForEach(children) { FileRow(entry: $0, currentFile: currentFile, tree: tree) }
+            } label: {
+                Label(entry.name, systemImage: "folder").lineLimit(1)
+            }
+            .tag(entry.url)
+            .onAppear { reloadChildrenIfExpanded() }
+            .onChange(of: expansion.expanded) { _, _ in reloadChildrenIfExpanded() }
+            .onChange(of: tree.version) { _, _ in reloadChildrenIfExpanded() }
+            .contextMenu { revealButton }
+        } else {
+            Label {
+                Text(entry.name).lineLimit(1)
+            } icon: {
+                Image(systemName: entry.isImage ? "photo" : entry.isTex ? "doc.text" : "doc")
+                    .foregroundStyle(entry.isTex ? Color.accentColor : Color.secondary)
+            }
+            .fontWeight(isCurrent ? .semibold : .regular)
+            .tag(entry.url)
+            .contextMenu { revealButton }
+        }
+    }
+
+    private var revealButton: some View {
+        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
     }
 }
 #endif
