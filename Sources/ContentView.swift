@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var shortcuts     = ShortcutStore.shared
     // true = editor/preview stacked top–bottom; false = side by side. Settings ⌘,.
     @AppStorage("previewSplitVertical") private var verticalSplit = false
+    @AppStorage("showSidebar") private var showSidebar = true
 
     var body: some View {
         splitLayout
@@ -51,25 +52,15 @@ struct ContentView: View {
     @ViewBuilder
     private var splitLayout: some View {
 #if os(macOS)
-        if verticalSplit {
-            VSplitView {
-                EditorView(source: $document.source, compiler: compiler,
-                           linter: linter, texLabClient: texLabClient)
-                    .frame(minHeight: 200)
-                PDFPreviewView(compiler: compiler)
-                    .frame(minHeight: 200)
+        HSplitView {
+            if showSidebar, let root = fileURL?.deletingLastPathComponent() {
+                SidebarView(root: root)
+                    .frame(minWidth: 160, idealWidth: 220, maxWidth: 360)
             }
-            .frame(minWidth: 700, minHeight: 500)
-        } else {
-            HSplitView {
-                EditorView(source: $document.source, compiler: compiler,
-                           linter: linter, texLabClient: texLabClient)
-                    .frame(minWidth: 280)
-                PDFPreviewView(compiler: compiler)
-                    .frame(minWidth: 280)
-            }
-            .frame(minWidth: 700, minHeight: 500)
+            editorPreviewSplit
+                .frame(minWidth: 560)
         }
+        .frame(minWidth: 700, minHeight: 500)
 #else
         HStack(spacing: 0) {
             EditorView(source: $document.source, compiler: compiler,
@@ -80,8 +71,40 @@ struct ContentView: View {
 #endif
     }
 
+#if os(macOS)
+    @ViewBuilder
+    private var editorPreviewSplit: some View {
+        if verticalSplit {
+            VSplitView {
+                EditorView(source: $document.source, compiler: compiler,
+                           linter: linter, texLabClient: texLabClient)
+                    .frame(minHeight: 200)
+                PDFPreviewView(compiler: compiler)
+                    .frame(minHeight: 200)
+            }
+        } else {
+            HSplitView {
+                EditorView(source: $document.source, compiler: compiler,
+                           linter: linter, texLabClient: texLabClient)
+                    .frame(minWidth: 280)
+                PDFPreviewView(compiler: compiler)
+                    .frame(minWidth: 280)
+            }
+        }
+    }
+#endif
+
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+#if os(macOS)
+        ToolbarItem(placement: .navigation) {
+            Button { showSidebar.toggle() } label: {
+                Label("Toggle Sidebar", systemImage: "sidebar.left")
+            }
+            .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
+            .help("Show/hide the file sidebar (\(shortcuts.combo(.toggleSidebar).display))")
+        }
+#endif
         ToolbarItem(placement: .automatic) {
             if !linter.warnings.isEmpty {
                 let errors   = linter.warnings.filter(\.isError).count
@@ -123,3 +146,90 @@ struct ContentView: View {
         }
     }
 }
+
+#if os(macOS)
+import AppKit
+
+private let previewableImageExts: Set<String> =
+    ["png", "jpg", "jpeg", "pdf", "gif", "tiff", "tif", "bmp", "heic"]
+
+/// A file/dir in the sidebar tree. `children == nil` ⇒ leaf (file); built eagerly on first show.
+private struct FileNode: Identifiable {
+    let url: URL
+    var children: [FileNode]?
+    var id: URL { url }
+    var name: String { url.lastPathComponent }
+    var isDir: Bool { children != nil }
+    var isImage: Bool { previewableImageExts.contains(url.pathExtension.lowercased()) }
+
+    // ponytail: built once, no FSEvents watcher — Refresh button rescans. Depth-capped to avoid runaway.
+    static func build(_ url: URL, depth: Int = 0) -> FileNode {
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+        guard isDir, depth < 8 else { return FileNode(url: url, children: nil) }
+        let kids = (try? FileManager.default.contentsOfDirectory(
+            at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+        let nodes = kids
+            .map { build($0, depth: depth + 1) }
+            .sorted { a, b in
+                if a.isDir != b.isDir { return a.isDir }          // dirs first
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
+        return FileNode(url: url, children: nodes)
+    }
+}
+
+/// Left sidebar: a file tree rooted at the open .tex file's directory. Clicking an image previews it.
+struct SidebarView: View {
+    let root: URL
+    @State private var tree: FileNode?
+    @State private var preview: FileNode?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(root.lastPathComponent).font(.caption).bold().lineLimit(1)
+                Spacer()
+                Button { tree = FileNode.build(root) } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Refresh")
+            }
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            Divider()
+            List {
+                if let children = tree?.children {
+                    OutlineGroup(children, id: \.id, children: \.children) { node in
+                        row(node)
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+        }
+        .onAppear { if tree == nil { tree = FileNode.build(root) } }
+        .onChange(of: root) { _, new in tree = FileNode.build(new) }
+        .popover(item: $preview) { node in
+            if let img = NSImage(contentsOf: node.url) {
+                Image(nsImage: img)
+                    .resizable().scaledToFit()
+                    .frame(maxWidth: 360, maxHeight: 360)
+                    .padding(8)
+            } else {
+                Text("Cannot preview \(node.name)").padding()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ node: FileNode) -> some View {
+        Label(node.name, systemImage: icon(node))
+            .lineLimit(1)
+            .contentShape(Rectangle())
+            .onTapGesture { if node.isImage { preview = node } }
+    }
+
+    private func icon(_ node: FileNode) -> String {
+        if node.isDir { return "folder" }
+        if node.isImage { return "photo" }
+        if node.url.pathExtension.lowercased() == "tex" { return "doc.text" }
+        return "doc"
+    }
+}
+#endif

@@ -87,4 +87,61 @@ final class ErrorPopover: NSObject {
         return vc
     }
 }
+
+/// Popover showing a thumbnail of the image referenced on a line (⌘. when the line has no error).
+final class ImagePreviewPopover: NSObject {
+    private let popover = NSPopover()
+    private let imageView = NSImageView()
+    private var widthC: NSLayoutConstraint!
+    private var heightC: NSLayoutConstraint!
+    private(set) var currentLine: Int?
+
+    var isShown: Bool { popover.isShown }
+
+    override init() {
+        super.init()
+        popover.behavior = .semitransient
+        popover.contentViewController = makeViewController()
+    }
+
+    func show(image: NSImage, line: Int, lineRect: NSRect, in view: NSView) {
+        currentLine = line
+        imageView.image = image
+        // Fit into a max box while keeping aspect; never upscale past native size.
+        let maxSide: CGFloat = 360
+        let s = image.size
+        let scale = min(maxSide / max(s.width, 1), maxSide / max(s.height, 1), 1)
+        widthC.constant  = max(s.width * scale, 32)
+        heightC.constant = max(s.height * scale, 32)
+        popover.contentViewController?.view.layoutSubtreeIfNeeded()
+
+        if popover.isShown { popover.close() }   // re-anchor to the new line
+        guard lineRect != .zero else { return }
+        popover.show(relativeTo: lineRect, of: view, preferredEdge: .maxY)
+    }
+
+    func close() {
+        currentLine = nil
+        if popover.isShown { popover.performClose(nil) }
+    }
+
+    private func makeViewController() -> NSViewController {
+        let vc = NSViewController()
+        let root = NSView()
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(imageView)
+        widthC  = imageView.widthAnchor.constraint(equalToConstant: 200)
+        heightC = imageView.heightAnchor.constraint(equalToConstant: 200)
+        NSLayoutConstraint.activate([
+            imageView.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
+            imageView.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            imageView.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
+            imageView.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
+            widthC, heightC,
+        ])
+        vc.view = root
+        return vc
+    }
+}
 #endif

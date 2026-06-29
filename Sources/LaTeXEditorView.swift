@@ -159,14 +159,78 @@ final class LaTeXTextView: NSTextView {
         if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return true
         }
+        // ⌘↩ open line below / ⇧⌘↩ open line above — wherever the caret sits on the line.
+        if !hasMarkedText(), event.charactersIgnoringModifiers == "\r" {
+            let f = event.modifierFlags
+            if f.contains(.command) && !f.contains(.option) && !f.contains(.control) {
+                openLine(above: f.contains(.shift)); return true
+            }
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    // Insert a blank line above/below the caret's line (matching its indent) and move the caret onto it.
+    private func openLine(above: Bool) {
+        let ns = string as NSString
+        let lineRange = ns.lineRange(for: selectedRange())
+        let lineFull = ns.substring(with: lineRange)
+        let hasNL = lineFull.hasSuffix("\n")
+        let indent = leadingWhitespace(of: hasNL ? String(lineFull.dropLast()) : lineFull)
+        let indentLen = (indent as NSString).length
+
+        let at: Int, text: String, caret: Int
+        if above {
+            at = lineRange.location
+            text = indent + "\n"
+            caret = at + indentLen
+        } else if hasNL {
+            at = lineRange.location + lineRange.length      // start of next line
+            text = indent + "\n"
+            caret = at + indentLen
+        } else {                                            // last line, no trailing newline
+            at = lineRange.location + lineRange.length
+            text = "\n" + indent
+            caret = at + 1 + indentLen
+        }
+        _ = replace(range: NSRange(location: at, length: 0), with: text,
+                    newSelection: NSRange(location: caret, length: 0))
     }
 
     override func keyDown(with event: NSEvent) {
         if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return
         }
+        // ⌥⇧↑ / ⌥⇧↓ duplicate the caret's line (or selected lines) up / down.
+        if !hasMarkedText() {
+            let f = event.modifierFlags
+            if f.contains(.option) && f.contains(.shift) && !f.contains(.command) && !f.contains(.control) {
+                if event.keyCode == 126 { duplicateLines(down: false); return }   // up arrow
+                if event.keyCode == 125 { duplicateLines(down: true);  return }   // down arrow
+            }
+        }
         super.keyDown(with: event)
+    }
+
+    // Duplicate the full lines spanned by the selection; caret/selection moves onto the new copy.
+    private func duplicateLines(down: Bool) {
+        let ns = string as NSString
+        let block = ns.lineRange(for: selectedRange())
+        let text = ns.substring(with: block)
+        let hasNL = text.hasSuffix("\n")
+        let sel = selectedRange()
+
+        let at: Int, inserted: String, shift: Int
+        if down {
+            at = block.location + block.length
+            inserted = hasNL ? text : "\n" + text
+            shift = hasNL ? block.length : block.length + 1
+        } else {                                            // up: new copy takes the original span
+            at = block.location
+            inserted = hasNL ? text : text + "\n"
+            shift = 0
+        }
+        _ = replace(range: NSRange(location: at, length: 0), with: inserted,
+                    newSelection: NSRange(location: sel.location + shift, length: sel.length))
     }
 
     /// Run an editor-owned command; false for commands handled elsewhere (build/sync via SwiftUI buttons).
@@ -408,6 +472,35 @@ final class LaTeXTextView: NSTextView {
     // MARK: - Error line highlight + popover
 
     private let errorPopover = ErrorPopover()
+    private let imagePopover = ImagePreviewPopover()
+
+    private static let includeGraphicsRegex = try! NSRegularExpression(
+        pattern: #"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}"#)
+
+    /// Loadable image file referenced by `\includegraphics{...}` on the cursor's line, else nil.
+    /// ponytail: resolves relative to the .tex dir only — no `\graphicspath`. Add if a project needs it.
+    private func imageURLOnCursorLine() -> URL? {
+        let ns = string as NSString
+        let loc = min(selectedRange().location, ns.length)
+        let line = ns.substring(with: ns.lineRange(for: NSRange(location: loc, length: 0)))
+        guard let m = Self.includeGraphicsRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              let r = Range(m.range(at: 1), in: line),
+              let baseDir = (delegate as? Coordinator)?.compiler?.fileURL?.deletingLastPathComponent()
+        else { return nil }
+        let raw = String(line[r]).trimmingCharacters(in: .whitespaces)
+        guard !raw.isEmpty else { return nil }
+
+        let fm = FileManager.default
+        let direct = baseDir.appendingPathComponent(raw)
+        if fm.fileExists(atPath: direct.path) { return direct }
+        if direct.pathExtension.isEmpty {   // LaTeX resolves the extension itself
+            for ext in ["pdf", "png", "jpg", "jpeg", "eps", "gif", "tiff", "tif", "bmp"] {
+                let u = direct.appendingPathExtension(ext)
+                if fm.fileExists(atPath: u.path) { return u }
+            }
+        }
+        return nil
+    }
 
     /// 1-based source line → error message. Lines get a light-red background; hover / ⌘. shows the message.
     var errorInfo: [Int: String] = [:] {
@@ -440,15 +533,27 @@ final class LaTeXTextView: NSTextView {
         return r
     }
 
-    /// ⌘. → toggle the error popover for the cursor's line.
+    /// ⌘. → toggle the error popover for the cursor's line; if the line has no error but
+    /// references an image, toggle an image-preview popover instead.
     private func toggleErrorPopoverAtCursor() {
         guard let lm = layoutManager, let tc = textContainer else { return }
         let ns = string as NSString
         let loc = min(selectedRange().location, ns.length)
         let line = ns.substring(to: loc).components(separatedBy: "\n").count
-        guard let msg = errorInfo[line] else { NSSound.beep(); return }
-        if errorPopover.isShown, errorPopover.currentLine == line { errorPopover.close() }
-        else { errorPopover.show(message: msg, line: line, lineRect: lineRect(line, lm: lm, tc: tc), in: self) }
+
+        if let msg = errorInfo[line] {
+            imagePopover.close()
+            if errorPopover.isShown, errorPopover.currentLine == line { errorPopover.close() }
+            else { errorPopover.show(message: msg, line: line, lineRect: lineRect(line, lm: lm, tc: tc), in: self) }
+            return
+        }
+        if let url = imageURLOnCursorLine(), let img = NSImage(contentsOf: url) {
+            errorPopover.close()
+            if imagePopover.isShown, imagePopover.currentLine == line { imagePopover.close() }
+            else { imagePopover.show(image: img, line: line, lineRect: lineRect(line, lm: lm, tc: tc), in: self) }
+            return
+        }
+        NSSound.beep()
     }
 
     // MARK: - Scroll sync
