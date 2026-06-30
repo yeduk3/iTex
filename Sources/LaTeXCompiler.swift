@@ -162,30 +162,47 @@ final class LaTeXCompiler {
         return out
     }
 
+    /// Force a clean rebuild: discard the document's cached build artifacts (latexmk state, aux,
+    /// stale PDF), then run a full compile from scratch.
+    func cleanBuild(source: String) async {
+#if os(macOS)
+        await warmEngine.kill()
+        if let fileURL { try? FileManager.default.removeItem(at: buildDir(for: fileURL)) }
+#endif
+        await compile(source: source, profile: .finalCompile)
+    }
+
+#if os(macOS)
+    /// Per-document scratch dir in the app's temp area — every build artifact lives here, never in
+    /// the user's source folder. Stable per file path so latexmk's incremental state persists.
+    private func buildDir(for fileURL: URL) -> URL {
+        workDir.appending(path: stableHash(fileURL.path), directoryHint: .isDirectory)
+    }
+#endif
+
     private func buildPDF(source: String, profile: CompileProfile) async throws -> CompileResult {
 #if os(macOS)
-        let texPath: URL, workingDir: URL
+        // All build artifacts (build copy + outputs) live in a per-document temp dir, never in the
+        // user's source folder. `cwd` stays the source dir so relative \includegraphics/\input
+        // resolve; the user's file is NEVER written out-of-band (its own save is the only writer —
+        // touching it would bump mtime and trip NSDocument's "modified externally" conflict).
+        // ponytail: jobname is "<base>-itexbuild"; a doc that hardcodes \jobname would notice.
+        let texPath: URL, cwd: URL, outDir: URL
         if let fileURL {
-            // Compile a build copy in the document's directory — relative
-            // \includegraphics/\input paths still resolve (workingDir = that dir),
-            // but the user's file is NEVER written out-of-band. Writing fileURL here
-            // bumps its mtime and triggers a false "modified externally" save conflict
-            // (NSDocument compares mtime on save). The document's own save is the only
-            // writer of fileURL.
-            // ponytail: jobname becomes "<base>-itexbuild" (vs "<base>"); a doc that
-            // hardcodes \jobname would notice. Fix the rare case if it ever shows up.
             let base = fileURL.deletingPathExtension().lastPathComponent
-            let dir  = fileURL.deletingLastPathComponent()
-            let buildTex = dir.appending(path: "\(base)-itexbuild.tex")
+            cwd = fileURL.deletingLastPathComponent()
+            outDir = buildDir(for: fileURL)
+            try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+            let buildTex = outDir.appending(path: "\(base)-itexbuild.tex")
             try Data(source.utf8).write(to: buildTex)
             texPath = buildTex
             compiledTexURL = buildTex
-            workingDir = dir
         } else {
             let tex = workDir.appending(path: "document.tex")
             try Data(source.utf8).write(to: tex)
             texPath = tex
-            workingDir = workDir
+            cwd = workDir
+            outDir = workDir
         }
 
         // Fast preview → warm pre-started engine for ALL engines (docs/03 §3.3): pdflatex,
@@ -199,28 +216,31 @@ final class LaTeXCompiler {
 
         if canWarm, profile == .fastPreview,
            let r = await warmEngine.tryCompile(buildTex: texPath, engine: engine,
-                                               preambleHash: preambleHash, workingDir: workingDir) {
+                                               preambleHash: preambleHash, outDir: outDir) {
             // Arm a fresh process so the next save is warm too (preamble pass runs during idle).
             // ponytail: re-arms every fast preview — a wasted spawn during rapid typing, but it's
             // background and each save still feeds the previously-warmed engine. Optimize if it bites.
             await warmEngine.arm(buildTex: texPath, engine: engine, preambleHash: preambleHash,
-                                 workingDir: workingDir, resources: resources)
+                                 cwd: cwd, outDir: outDir, resources: resources)
             return r
         }
 
         // latexmk: finalCompile (rerun-until-stable + biber, the correctness backstop), a warm miss,
-        // or an unsaved doc. Then prime/arm the warm engine for the next fast preview.
-        let r = try await LatexmkBackend().compile(texPath: texPath, workingDir: workingDir, engine: engine, profile: profile)
+        // or an unsaved doc. Kill any parked warm engine first — it shares jobname+outdir with
+        // latexmk, so a concurrent run corrupts <base>.xdv/.aux and wedges latexmk's error state.
+        // arm() below re-arms a fresh one for the next fast preview.
+        await warmEngine.kill()
+        let r = try await LatexmkBackend().compile(texPath: texPath, cwd: cwd, outDir: outDir, engine: engine, profile: profile)
         if canWarm {
             await warmEngine.arm(buildTex: texPath, engine: engine, preambleHash: preambleHash,
-                                 workingDir: workingDir, resources: resources)
+                                 cwd: cwd, outDir: outDir, resources: resources)
         }
         return r
 #elseif ITEX_TECTONIC
         // iOS: in-process Tectonic (no subprocess). Requires the FFI lib + a shipped local bundle.
         let tex = workDir.appending(path: "document.tex")
         try Data(source.utf8).write(to: tex)
-        return try await TectonicBackend().compile(texPath: tex, workingDir: workDir, engine: engine, profile: profile)
+        return try await TectonicBackend().compile(texPath: tex, cwd: workDir, outDir: workDir, engine: engine, profile: profile)
 #else
         // iOS without the Tectonic lib linked yet.
         throw CompilerError.platformUnsupported

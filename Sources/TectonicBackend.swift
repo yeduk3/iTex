@@ -12,10 +12,10 @@ import CItexTectonic
 #endif
 
 struct TectonicBackend: CompileBackend {
-    func compile(texPath: URL, workingDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult {
+    func compile(texPath: URL, cwd: URL, outDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult {
         let source = try String(contentsOf: texPath, encoding: .utf8)
         let pdf = try Self.latexToPDF(source)
-        let out = workingDir.appending(path: texPath.deletingPathExtension().lastPathComponent + ".pdf")
+        let out = outDir.appending(path: texPath.deletingPathExtension().lastPathComponent + ".pdf")
         try pdf.write(to: out)
         // SyncTeX from Tectonic: pass --synctex via the V2 driver (TODO when wiring the local bundle).
         return CompileResult(pdfURL: out, synctexURL: nil, log: "tectonic in-process (\(pdf.count) bytes)")

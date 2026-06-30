@@ -6,6 +6,7 @@ import AppKit
 struct ShortcutSettingsView: View {
     @State private var store = ShortcutStore.shared
     @AppStorage("previewSplitVertical") private var verticalSplit = false
+    @AppStorage("editorTabWidth") private var tabWidth = 2
 
     var body: some View {
         Form {
@@ -15,6 +16,9 @@ struct ShortcutSettingsView: View {
                     Text("Stacked (vertical)").tag(true)
                 }
                 .pickerStyle(.radioGroup)
+                Stepper(value: $tabWidth, in: 1...8) {
+                    Text("Tab width: \(tabWidth) spaces")
+                }
             } header: {
                 Text("Layout")
             }

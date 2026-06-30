@@ -67,10 +67,20 @@ private struct PDFKitRepresentable: NSViewRepresentable {
         if coord.lastCompilationID != compiler.compilationID {
             coord.lastCompilationID = compiler.compilationID
             let scale = view.scaleFactor
+            // currentDestination's page belongs to the OLD document; go(to:) can't match it
+            // after the swap and snaps to the top. Re-anchor by page index into the new doc.
             let dest = view.currentDestination
+            let pageIndex = dest.flatMap { d -> Int? in
+                guard let p = d.page else { return nil }
+                let i = view.document?.index(for: p) ?? NSNotFound
+                return i == NSNotFound ? nil : i
+            }
             view.document = PDFDocument(url: url)
             view.scaleFactor = scale
-            if let dest { view.go(to: dest) }
+            if let dest, let pageIndex, let page = view.document?.page(at: pageIndex) {
+                compiler.beginSyncCooldown()   // restored scroll must not echo to the editor via scroll-sync
+                view.go(to: PDFDestination(page: page, at: dest.point))
+            }
         }
 
         // Apply a forward-search highlight (manual ⌘J or scroll-sync) — center it.
@@ -195,10 +205,18 @@ private struct PDFKitRepresentable: UIViewRepresentable {
         if context.coordinator.lastCompilationID != compiler.compilationID {
             context.coordinator.lastCompilationID = compiler.compilationID
             let scale = view.scaleFactor
+            // Re-anchor by page index: currentDestination's page is from the old doc (see macOS).
             let dest = view.currentDestination
+            let pageIndex = dest.flatMap { d -> Int? in
+                guard let p = d.page else { return nil }
+                let i = view.document?.index(for: p) ?? NSNotFound
+                return i == NSNotFound ? nil : i
+            }
             view.document = PDFDocument(url: url)
             view.scaleFactor = scale
-            if let dest { view.go(to: dest) }
+            if let dest, let pageIndex, let page = view.document?.page(at: pageIndex) {
+                view.go(to: PDFDestination(page: page, at: dest.point))
+            }
         }
     }
 

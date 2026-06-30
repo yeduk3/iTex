@@ -10,6 +10,11 @@ struct ContentView: View {
     // true = editor/preview stacked top–bottom; false = side by side. Settings ⌘,.
     @AppStorage("previewSplitVertical") private var verticalSplit = false
     @AppStorage("showSidebar") private var showSidebar = true
+    @AppStorage("splitFractionH") private var splitFractionH = 0.5   // editor share, side-by-side
+    @AppStorage("splitFractionV") private var splitFractionV = 0.5   // editor share, stacked
+#if os(macOS)
+    @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
+#endif
 
     var body: some View {
         splitLayout
@@ -52,13 +57,10 @@ struct ContentView: View {
     @ViewBuilder
     private var splitLayout: some View {
 #if os(macOS)
-        // NavigationSplitView (macOS standard, like qmd): native animated sidebar
-        // reveal/collapse + drag-resize. ⌘\ drives `showSidebar`; the auto toggle is
-        // removed so our single toolbar button owns the shortcut.
-        NavigationSplitView(columnVisibility: Binding(
-            get: { showSidebar ? .all : .detailOnly },
-            set: { showSidebar = ($0 != .detailOnly) }
-        )) {
+        // NavigationSplitView (macOS standard, like qmd): the built-in toggle lives in the
+        // sidebar and animates reveal/collapse natively — we keep it as the single button.
+        // ⌘\ drives the same animated toggle via a hidden shortcut (no second visible button).
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(root: fileURL?.deletingLastPathComponent(), currentFile: fileURL)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
         } detail: {
@@ -66,8 +68,14 @@ struct ContentView: View {
                 .frame(minWidth: 560)
         }
         .navigationSplitViewStyle(.balanced)
-        .toolbar(removing: .sidebarToggle)
         .frame(minWidth: 700, minHeight: 500)
+        .background {
+            Button("Toggle Sidebar", action: toggleSidebar)
+                .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
+                .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
+        }
+        .onAppear { columnVisibility = showSidebar ? .all : .doubleColumn }
+        .onChange(of: columnVisibility) { _, v in showSidebar = (v != .detailOnly) }
 #else
         HStack(spacing: 0) {
             EditorView(source: $document.source, compiler: compiler,
@@ -79,39 +87,26 @@ struct ContentView: View {
     }
 
 #if os(macOS)
-    @ViewBuilder
+    private func toggleSidebar() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            columnVisibility = (columnVisibility == .detailOnly) ? .doubleColumn : .detailOnly
+        }
+    }
+
     private var editorPreviewSplit: some View {
-        if verticalSplit {
-            VSplitView {
-                EditorView(source: $document.source, compiler: compiler,
-                           linter: linter, texLabClient: texLabClient)
-                    .frame(minHeight: 200)
-                PDFPreviewView(compiler: compiler)
-                    .frame(minHeight: 200)
-            }
-        } else {
-            HSplitView {
-                EditorView(source: $document.source, compiler: compiler,
-                           linter: linter, texLabClient: texLabClient)
-                    .frame(minWidth: 280)
-                PDFPreviewView(compiler: compiler)
-                    .frame(minWidth: 280)
-            }
+        // Custom split (not HSplitView): SwiftUI's divider grab zone is ~1px and unconfigurable.
+        DraggableSplit(vertical: verticalSplit,
+                       fraction: verticalSplit ? $splitFractionV : $splitFractionH) {
+            EditorView(source: $document.source, compiler: compiler,
+                       linter: linter, texLabClient: texLabClient)
+        } second: {
+            PDFPreviewView(compiler: compiler)
         }
     }
 #endif
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-#if os(macOS)
-        ToolbarItem(placement: .navigation) {
-            Button { withAnimation(.easeInOut(duration: 0.22)) { showSidebar.toggle() } } label: {
-                Label("Toggle Sidebar", systemImage: "sidebar.left")
-            }
-            .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
-            .help("Show/hide the file sidebar (\(shortcuts.combo(.toggleSidebar).display))")
-        }
-#endif
         ToolbarItem(placement: .automatic) {
             if !linter.warnings.isEmpty {
                 let errors   = linter.warnings.filter(\.isError).count
@@ -151,12 +146,78 @@ struct ContentView: View {
                     .help("Final build: full-res images, rerun-until-stable + biber (\(shortcuts.combo(.build).display))")
             }
         }
+        ToolbarItem(placement: .automatic) {
+            Button { Task { await compiler.cleanBuild(source: document.source) } }
+                label: { Label("Clean Build", systemImage: "arrow.triangle.2.circlepath") }
+                .keyboardShortcut(shortcuts.combo(.cleanBuild).keyboardShortcut)
+                .disabled(compiler.isCompiling)
+                .help("Clean build: wipe cached artifacts, then full compile (\(shortcuts.combo(.cleanBuild).display))")
+        }
     }
 }
 
 #if os(macOS)
 import AppKit
 import CoreServices
+
+// MARK: - Resizable split with a wide grab zone
+
+/// Two panes with a draggable divider whose hit area is `handle`-wide (vs HSplitView's ~1px),
+/// so the boundary is easy to grab. `fraction` is the first pane's share, persisted by the caller.
+private struct DraggableSplit<First: View, Second: View>: View {
+    let vertical: Bool
+    @Binding var fraction: Double
+    @ViewBuilder let first: () -> First
+    @ViewBuilder let second: () -> Second
+
+    private let handle: CGFloat = 10
+    private let minFrac = 0.15
+    @State private var dragStart: Double?
+
+    var body: some View {
+        GeometryReader { geo in
+            let total = vertical ? geo.size.height : geo.size.width
+            let f = min(max(fraction, minFrac), 1 - minFrac)
+            let firstLen = total * f
+            if vertical {
+                VStack(spacing: 0) {
+                    first().frame(height: firstLen)
+                    divider(total: total)
+                    second()
+                }
+            } else {
+                HStack(spacing: 0) {
+                    first().frame(width: firstLen)
+                    divider(total: total)
+                    second()
+                }
+            }
+        }
+    }
+
+    private func divider(total: CGFloat) -> some View {
+        Color.clear
+            .frame(width: vertical ? nil : handle, height: vertical ? handle : nil)
+            .frame(maxWidth: vertical ? .infinity : nil, maxHeight: vertical ? nil : .infinity)
+            .overlay(Rectangle().fill(Color(nsColor: .separatorColor))
+                .frame(width: vertical ? nil : 1, height: vertical ? 1 : nil))
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside { (vertical ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).push() }
+                else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture()
+                    .onChanged { v in
+                        let start = dragStart ?? fraction
+                        if dragStart == nil { dragStart = start }
+                        let delta = Double((vertical ? v.translation.height : v.translation.width)) / Double(total)
+                        fraction = min(max(start + delta, minFrac), 1 - minFrac)
+                    }
+                    .onEnded { _ in dragStart = nil }
+            )
+    }
+}
 
 // MARK: - Sidebar (ported from qmd: DisclosureGroup + lazy children + FSEvents watcher)
 

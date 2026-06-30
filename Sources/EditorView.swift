@@ -5,6 +5,7 @@ struct EditorView: View {
     let compiler: LaTeXCompiler
     let linter: ChkTexLinter
     var texLabClient: TexLabClient?
+    @AppStorage("editorTabWidth") private var tabWidth = 2
 
     /// Compile-failure messages + chktex errors, keyed by source line.
     private var mergedErrors: [Int: String] {
@@ -20,7 +21,8 @@ struct EditorView: View {
         // — compiler.errorMessage kept for a future dedicated panel.
         LaTeXEditorView(text: $source, texLabClient: texLabClient, compiler: compiler,
                         errorMessages: mergedErrors,
-                        selectReq: compiler.selectLineRequest, scrollReq: compiler.scrollToLineRequest)
+                        selectReq: compiler.selectLineRequest, scrollReq: compiler.scrollToLineRequest,
+                        tabWidth: tabWidth)
             .onChange(of: source) { _, new in
                 // Keep the LSP in sync live (completions need it); compile/lint moved to save.
                 texLabClient?.changeDocument(text: new)

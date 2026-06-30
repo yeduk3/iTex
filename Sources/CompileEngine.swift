@@ -17,8 +17,10 @@ struct CompileResult {
 /// One compile strategy. macOS backends shell out (latexmk / warm pdflatex); the iOS backend
 /// runs Tectonic in-process. Cross-platform so iOS can conform (docs/04 §4.1).
 protocol CompileBackend {
-    /// `texPath` is already written to disk. Compile it in `workingDir`.
-    func compile(texPath: URL, workingDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult
+    /// `texPath` is already written to disk. `cwd` is where relative \includegraphics/\input
+    /// resolve (the user's source dir); `outDir` receives every build artifact (kept out of the
+    /// source folder). They may be the same dir for backends that don't separate them.
+    func compile(texPath: URL, cwd: URL, outDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult
 }
 
 #if os(macOS)
@@ -80,31 +82,47 @@ enum Subprocess {
 // MARK: - latexmk backend (default — correct reruns + biber + SyncTeX, docs/03 §3.1)
 
 struct LatexmkBackend: CompileBackend {
-    func compile(texPath: URL, workingDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult {
+    func compile(texPath: URL, cwd: URL, outDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult {
         let base = texPath.deletingPathExtension().lastPathComponent
+        let pdf = outDir.appending(path: base + ".pdf")
+        let syn = outDir.appending(path: base + ".synctex.gz")
 
+        var r = await runOnce(texPath: texPath, cwd: cwd, outDir: outDir, engine: engine, profile: profile)
+        // latexmk sticky-error state: once a run errors it records it in <base>.fdb_latexmk and then
+        // REFUSES to rebuild until the source changes ("gave an error in previous invocation"),
+        // exiting nonzero forever — a one-off interruption (or a warm-engine jobname clash) wedges
+        // the preview permanently. Clear its db + the corrupt outputs and retry once.
+        if r.status != 0, r.output.contains("previous invocation of latexmk") {
+            for ext in ["fdb_latexmk", "pdf", "xdv"] {
+                try? FileManager.default.removeItem(at: outDir.appending(path: base + "." + ext))
+            }
+            r = await runOnce(texPath: texPath, cwd: cwd, outDir: outDir, engine: engine, profile: profile)
+        }
+        guard r.status == 0, FileManager.default.fileExists(atPath: pdf.path) else {
+            throw CompilerError.buildFailed(r.output)
+        }
+        let synURL = FileManager.default.fileExists(atPath: syn.path) ? syn : nil
+        return CompileResult(pdfURL: pdf, synctexURL: synURL, log: r.output)
+    }
+
+    private func runOnce(texPath: URL, cwd: URL, outDir: URL, engine: TexEngine, profile: CompileProfile) async -> (status: Int32, output: String) {
+        // -cd-: stay in `cwd` (relative \includegraphics/\input resolve there) while writing all
+        // artifacts to -outdir. latexmk would otherwise chdir to the input file's (temp) dir.
         var args = [
             "latexmk",
             engine.latexmkFlag,
             "-synctex=1",
             "-interaction=nonstopmode",
             "-file-line-error",
-            "-outdir=" + workingDir.path,
+            "-cd-",
+            "-outdir=" + outDir.path,
         ]
         if profile == .fastPreview {
             // Skip image decode/embed without touching the user's source (docs/03 §3.4, verified).
             args.append("-usepretex=\\PassOptionsToPackage{draft}{graphicx}")
         }
-        args.append(texPath.lastPathComponent)
-
-        let r = await Subprocess.run(args, cwd: workingDir)
-        let pdf = workingDir.appending(path: base + ".pdf")
-        let syn = workingDir.appending(path: base + ".synctex.gz")
-        guard r.status == 0, FileManager.default.fileExists(atPath: pdf.path) else {
-            throw CompilerError.buildFailed(r.output)
-        }
-        let synURL = FileManager.default.fileExists(atPath: syn.path) ? syn : nil
-        return CompileResult(pdfURL: pdf, synctexURL: synURL, log: r.output)
+        args.append(texPath.path)
+        return await Subprocess.run(args, cwd: cwd)
     }
 }
 
@@ -140,7 +158,7 @@ actor WarmEngine {
 
     /// Spawn a fresh engine that loads the preamble of `buildTex` and parks at \begin{document}.
     /// Kills any previously parked process first. No-op result on launch failure (warm unavailable).
-    func arm(buildTex: URL, engine: TexEngine, preambleHash: String, workingDir: URL, resources: String) {
+    func arm(buildTex: URL, engine: TexEngine, preambleHash: String, cwd: URL, outDir: URL, resources: String) {
         kill()
         let job = buildTex.deletingPathExtension().lastPathComponent
         // Inject graphicx draft BEFORE the preamble loads → images become labelled boxes, skipping
@@ -153,10 +171,10 @@ actor WarmEngine {
 
         let p = Process()
         p.executableURL = URL(filePath: "/usr/bin/env")
-        p.currentDirectoryURL = workingDir
+        p.currentDirectoryURL = cwd   // relative graphics/input resolve in the source dir
         // No -interaction flag: errorstopmode is required for the .sty's terminal \read.
         p.arguments = [engine.rawValue, "-synctex=1", "-file-line-error",
-                       "-jobname=" + job, "-output-directory=" + workingDir.path, wrapper]
+                       "-jobname=" + job, "-output-directory=" + outDir.path, wrapper]
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = Subprocess.texPATH + ":" + (env["PATH"] ?? "")
         env["TEXINPUTS"] = resources + ":" + (env["TEXINPUTS"] ?? "")   // find vendored fastrecompile.sty
@@ -181,7 +199,7 @@ actor WarmEngine {
 
     /// Feed the body to the parked engine and await the PDF. Returns nil (→ caller falls back to
     /// latexmk) if nothing is armed, the preamble/engine changed, the process died, or no PDF resulted.
-    func tryCompile(buildTex: URL, engine: TexEngine, preambleHash: String, workingDir: URL) async -> CompileResult? {
+    func tryCompile(buildTex: URL, engine: TexEngine, preambleHash: String, outDir: URL) async -> CompileResult? {
         guard let p = proc, let sin = stdinHandle, let out = outHandle, let sink = sink,
               p.isRunning, armedKey == key(engine, preambleHash, buildTex)
         else { return nil }
@@ -201,8 +219,8 @@ actor WarmEngine {
         }
 
         let base = buildTex.deletingPathExtension().lastPathComponent
-        let pdf = workingDir.appending(path: base + ".pdf")
-        let syn = workingDir.appending(path: base + ".synctex.gz")
+        let pdf = outDir.appending(path: base + ".pdf")
+        let syn = outDir.appending(path: base + ".synctex.gz")
         guard status == 0, FileManager.default.fileExists(atPath: pdf.path) else { return nil }
         let synURL = FileManager.default.fileExists(atPath: syn.path) ? syn : nil
         return CompileResult(pdfURL: pdf, synctexURL: synURL, log: sink.string())
@@ -216,67 +234,8 @@ actor WarmEngine {
     }
 }
 
-// MARK: - Warm precompiled-format backend (pdflatex only, docs/03 §3.2)
-//
-// ponytail: pdflatex-only by nature (xelatex/lualatex can't dump fontspec state — verified
-// against latexmk's precompile-preamble rcfile). Splits preamble→.fmt, pads the body file so
-// SyncTeX line numbers stay correct. Trades the .synctex (returns nil) for latency; SyncTeX
-// still comes from the latexmk path. Upgrade path: tex-fast-recompile warm process for xelatex.
-
-struct PrecompiledFormatBackend: CompileBackend {
-    func compile(texPath: URL, workingDir: URL, engine: TexEngine, profile: CompileProfile) async throws -> CompileResult {
-        guard engine == .pdflatex else {
-            // Not applicable — caller should have routed elsewhere; fall back to latexmk.
-            return try await LatexmkBackend().compile(texPath: texPath, workingDir: workingDir, engine: engine, profile: profile)
-        }
-        let source = (try? String(contentsOf: texPath, encoding: .utf8)) ?? ""
-        let lines = source.components(separatedBy: "\n")
-        guard let beginIdx = lines.firstIndex(where: { $0.contains("\\begin{document}") }) else {
-            return try await LatexmkBackend().compile(texPath: texPath, workingDir: workingDir, engine: engine, profile: profile)
-        }
-
-        let base = texPath.deletingPathExtension().lastPathComponent
-        let preamble = lines[..<beginIdx].joined(separator: "\n")
-        let fmtName = ".itex-fmt-" + stableHash(preamble)
-        let fmtFile = workingDir.appending(path: fmtName + ".fmt")
-
-        // Build the format only when the preamble changed.
-        if !FileManager.default.fileExists(atPath: fmtFile.path) {
-            // Clear stale formats from earlier preambles.
-            if let old = try? FileManager.default.contentsOfDirectory(atPath: workingDir.path) {
-                for f in old where f.hasPrefix(".itex-fmt-") { try? FileManager.default.removeItem(at: workingDir.appending(path: f)) }
-            }
-            let preFile = workingDir.appending(path: fmtName + "-pre.tex")
-            try (preamble + "\n\\endofdump\n").write(to: preFile, atomically: true, encoding: .utf8)
-            let mk = await Subprocess.run(
-                ["pdflatex", "-ini", "-jobname=" + fmtName, "&pdflatex", "mylatexformat.ltx", preFile.lastPathComponent],
-                cwd: workingDir)
-            guard FileManager.default.fileExists(atPath: fmtFile.path) else {
-                _ = mk
-                return try await LatexmkBackend().compile(texPath: texPath, workingDir: workingDir, engine: engine, profile: profile)
-            }
-        }
-
-        // Body file: line 1 = format reference, blank-pad so \begin{document} keeps its original
-        // line number (→ SyncTeX line mapping unchanged), then the body verbatim.
-        let bodyName = ".itex-body-" + base
-        let padding = String(repeating: "\n", count: max(0, beginIdx - 1))
-        let body = "%&" + fmtName + "\n" + padding + lines[beginIdx...].joined(separator: "\n")
-        let bodyFile = workingDir.appending(path: bodyName + ".tex")
-        try body.write(to: bodyFile, atomically: true, encoding: .utf8)
-
-        var args = ["pdflatex", "-interaction=nonstopmode", "-file-line-error", "-jobname=" + base]
-        if profile == .fastPreview { args.append("-synctex=0") }
-        args.append(bodyFile.lastPathComponent)
-
-        let r = await Subprocess.run(args, cwd: workingDir)
-        let pdf = workingDir.appending(path: base + ".pdf")
-        guard FileManager.default.fileExists(atPath: pdf.path) else {
-            throw CompilerError.buildFailed(r.output)
-        }
-        return CompileResult(pdfURL: pdf, synctexURL: nil, log: r.output)
-    }
-}
+// ponytail: removed PrecompiledFormatBackend (pdflatex-only .fmt path) — dead since WarmEngine
+// (tex-fast-recompile) covers all engines. Restore from git if a .fmt fast path is ever needed.
 
 // MARK: - Image proxy cache (docs/03 §3.6) — downscale oversized rasters, cached by content.
 //

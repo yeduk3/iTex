@@ -72,11 +72,11 @@ struct WelcomeView: View {
 
     private func newDoc() {
         newDocument(LaTeXDocument())
-        dismissWindow(id: "welcome")
+        dismissWindow()   // this welcome window (multiple may be open)
     }
 
     private func open(_ url: URL) {
-        Task { try? await openDocument(at: url); dismissWindow(id: "welcome") }
+        Task { try? await openDocument(at: url); dismissWindow() }
     }
 
     private func openPanel() {

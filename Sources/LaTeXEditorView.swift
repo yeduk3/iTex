@@ -147,7 +147,7 @@ final class LaTeXTextView: NSTextView {
 
     // MARK: - VSCode-like editing
 
-    private let indentUnit = "  "   // Tab → 2 spaces
+    private let indentUnit = "\t"   // Tab / auto-indent → real tab
 
     // Environments wrappable via `\env` + Tab (after picking the command from completion).
     private static let listEnvironments: Set<String> = ["itemize", "enumerate", "description"]
@@ -200,12 +200,13 @@ final class LaTeXTextView: NSTextView {
         if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return
         }
-        // ⌥⇧↑ / ⌥⇧↓ duplicate the caret's line (or selected lines) up / down.
+        // ⌥↑ / ⌥↓ move the line (or selected lines); ⌥⇧↑ / ⌥⇧↓ duplicate them.
         if !hasMarkedText() {
             let f = event.modifierFlags
-            if f.contains(.option) && f.contains(.shift) && !f.contains(.command) && !f.contains(.control) {
-                if event.keyCode == 126 { duplicateLines(down: false); return }   // up arrow
-                if event.keyCode == 125 { duplicateLines(down: true);  return }   // down arrow
+            if f.contains(.option) && !f.contains(.command) && !f.contains(.control) {
+                let dup = f.contains(.shift)
+                if event.keyCode == 126 { dup ? duplicateLines(down: false) : moveLines(down: false); return }  // up
+                if event.keyCode == 125 { dup ? duplicateLines(down: true)  : moveLines(down: true);  return }  // down
             }
         }
         super.keyDown(with: event)
@@ -231,6 +232,48 @@ final class LaTeXTextView: NSTextView {
         }
         _ = replace(range: NSRange(location: at, length: 0), with: inserted,
                     newSelection: NSRange(location: sel.location + shift, length: sel.length))
+    }
+
+    // Swap the full lines spanned by the selection with the adjacent line, keeping them selected.
+    // Handles the doc's last line having no trailing newline (re-homes the \n so the end stays bare).
+    private func moveLines(down: Bool) {
+        let ns = string as NSString
+        let block = ns.lineRange(for: selectedRange())
+        let sel = selectedRange()
+        let offset = sel.location - block.location   // selection start relative to the block
+
+        let combined: NSRange, newText: String, newBlockStart: Int
+        if down {
+            let nextStart = block.location + block.length
+            guard nextStart < ns.length else { NSSound.beep(); return }   // already last line
+            let next = ns.lineRange(for: NSRange(location: nextStart, length: 0))
+            combined = NSRange(location: block.location, length: block.length + next.length)
+            var b = ns.substring(with: block)
+            let n = ns.substring(with: next)
+            if n.hasSuffix("\n") {
+                newText = n + b
+                newBlockStart = combined.location + (n as NSString).length
+            } else {                                  // next is the bare last line: re-home block's \n
+                b = String(b.dropLast())
+                newText = n + "\n" + b
+                newBlockStart = combined.location + (n as NSString).length + 1
+            }
+        } else {
+            guard block.location > 0 else { NSSound.beep(); return }      // already first line
+            let prev = ns.lineRange(for: NSRange(location: block.location - 1, length: 0))
+            combined = NSRange(location: prev.location, length: prev.length + block.length)
+            let b = ns.substring(with: block)
+            var p = ns.substring(with: prev)
+            if b.hasSuffix("\n") {
+                newText = b + p
+            } else {                                  // block is the bare last line: re-home prev's \n
+                p = String(p.dropLast())
+                newText = b + "\n" + p
+            }
+            newBlockStart = combined.location
+        }
+        replace(range: combined, with: newText,
+                newSelection: NSRange(location: newBlockStart + offset, length: sel.length))
     }
 
     /// Run an editor-owned command; false for commands handled elsewhere (build/sync via SwiftUI buttons).
@@ -332,6 +375,21 @@ final class LaTeXTextView: NSTextView {
             if let close = pairs[prev], nextChar() == close {
                 replace(range: NSRange(location: sel.location - 1, length: 2), with: "",
                         newSelection: NSRange(location: sel.location - 1, length: 0))
+                handled = true
+            }
+        }
+        // Soft-tab backspace: inside leading spaces, erase one indent unit (back to the
+        // previous tab stop) so indentation deletes as a unit, not space-by-space.
+        if !handled, sel.length == 0, sel.location > 0 {
+            let ns = string as NSString
+            let lineStart = ns.lineRange(for: NSRange(location: sel.location, length: 0)).location
+            let col = sel.location - lineStart
+            let before = ns.substring(with: NSRange(location: lineStart, length: col))
+            if col > 0, before.allSatisfy({ $0 == " " }) {
+                let unit = indentUnit.count
+                let remove = col - ((col - 1) / unit) * unit   // back to prev multiple of unit (≥1)
+                replace(range: NSRange(location: sel.location - remove, length: remove), with: "",
+                        newSelection: NSRange(location: sel.location - remove, length: 0))
                 handled = true
             }
         }
@@ -626,8 +684,18 @@ struct LaTeXEditorView: NSViewRepresentable {
     var errorMessages: [Int: String] = [:]
     var selectReq: SelectLineRequest?    // diffed so updateNSView runs on inverse search / scroll-sync
     var scrollReq: SelectLineRequest?
+    var tabWidth: Int = 2                 // tab render width in spaces (Settings)
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// Paragraph style that renders a tab at `tabWidth` space-widths (no wide default tab stops).
+    private func tabParagraphStyle(font: NSFont) -> NSParagraphStyle {
+        let spaceW = (" " as NSString).size(withAttributes: [.font: font]).width
+        let style = NSMutableParagraphStyle()
+        style.tabStops = []
+        style.defaultTabInterval = spaceW * CGFloat(max(1, tabWidth))
+        return style
+    }
 
     /// NSRange of a 1-based line, for SyncTeX inverse-search selection.
     static func range(ofLine line: Int, in string: String) -> NSRange? {
@@ -658,6 +726,12 @@ struct LaTeXEditorView: NSViewRepresentable {
         tv.usesFontPanel   = false
         tv.usesRuler       = false
         tv.font            = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        // Render a tab at `tabWidth` space-widths instead of the wide default tab stop.
+        let tabStyle = tabParagraphStyle(font: tv.font!)
+        tv.defaultParagraphStyle = tabStyle
+        tv.typingAttributes[.paragraphStyle] = tabStyle
+        context.coordinator.tabStyle = tabStyle
+        context.coordinator.appliedTabWidth = tabWidth
         tv.isAutomaticQuoteSubstitutionEnabled  = false
         tv.isAutomaticDashSubstitutionEnabled   = false
         tv.isAutomaticSpellingCorrectionEnabled = false
@@ -683,8 +757,21 @@ struct LaTeXEditorView: NSViewRepresentable {
         guard let tv = scrollView.documentView as? LaTeXTextView else { return }
         context.coordinator.texLabClient = texLabClient   // keep in sync
         context.coordinator.compiler = compiler
+        if context.coordinator.appliedTabWidth != tabWidth, let font = tv.font {   // Settings changed tab width
+            let style = tabParagraphStyle(font: font)
+            tv.defaultParagraphStyle = style
+            tv.typingAttributes[.paragraphStyle] = style
+            context.coordinator.tabStyle = style
+            context.coordinator.appliedTabWidth = tabWidth
+            tv.textStorage?.addAttribute(.paragraphStyle, value: style,
+                range: NSRange(location: 0, length: (tv.string as NSString).length))
+        }
         if tv.string != text {
             tv.string = text
+            if let style = context.coordinator.tabStyle {   // string setter drops paragraph style; reapply
+                tv.textStorage?.addAttribute(.paragraphStyle, value: style,
+                    range: NSRange(location: 0, length: (text as NSString).length))
+            }
             if let lm = tv.layoutManager { Syntax.apply(to: lm, string: text) }
         }
         tv.errorInfo = errorMessages      // light-red background + hover/⌘. message popover
@@ -715,6 +802,8 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     weak var textView: LaTeXTextView?
     var lastSelectToken = -1
     var lastScrollLineToken = -1
+    var tabStyle: NSParagraphStyle?
+    var appliedTabWidth = -1
     private var scrollWork: DispatchWorkItem?
 
     init(_ parent: LaTeXEditorView) {
@@ -764,6 +853,7 @@ struct LaTeXEditorView: UIViewRepresentable {
     var errorMessages: [Int: String] = [:]  // unused on iOS
     var selectReq: SelectLineRequest? = nil
     var scrollReq: SelectLineRequest? = nil
+    var tabWidth: Int = 2                    // unused on iOS
 
     func makeUIView(context: Context) -> UITextView {
         let tv = UITextView()
