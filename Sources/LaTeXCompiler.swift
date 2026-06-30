@@ -130,6 +130,11 @@ final class LaTeXCompiler {
             if let syn = result.synctexURL { synctexURL = syn }
             errorMessages = [:]
             compilationID += 1
+#if os(macOS)
+            // Mirror the full build PDF next to the .tex (the user-facing output). Only on a real
+            // build — fast-preview saves draft images, so they stay in temp.
+            if profile == .finalCompile { exportPDF(from: result.pdfURL) }
+#endif
         } catch {
             errorMessage = (error as? CompilerError)?.displayMessage ?? error.localizedDescription
             errorMessages = (error as? CompilerError).map(Self.errorMessages(from:)) ?? [:]
@@ -177,6 +182,17 @@ final class LaTeXCompiler {
     /// the user's source folder. Stable per file path so latexmk's incremental state persists.
     private func buildDir(for fileURL: URL) -> URL {
         workDir.appending(path: stableHash(fileURL.path), directoryHint: .isDirectory)
+    }
+
+    /// Copy the freshly built PDF next to the source .tex as "<base>.pdf" — the only artifact that
+    /// lands in the user's folder. Writes a sibling of the .tex, never the .tex itself (no mtime
+    /// conflict). ponytail: copies on the main actor; a multi-MB PDF is a brief hitch, move to a
+    /// detached task if it ever bites.
+    private func exportPDF(from built: URL) {
+        guard let fileURL else { return }
+        let dest = fileURL.deletingPathExtension().appendingPathExtension("pdf")
+        try? FileManager.default.removeItem(at: dest)
+        try? FileManager.default.copyItem(at: built, to: dest)
     }
 #endif
 
