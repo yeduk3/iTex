@@ -17,6 +17,39 @@ enum LaTeXCommands {
         "corollary", "remark", "example", "document", "thebibliography",
     ]
 
+    // Common brace-taking commands → insert template. Empty groups become sequential tab stops
+    // at accept time (texlab sends bare command names, so the stops come from here). Key = label
+    // (no backslash); env-wrappable names are handled separately and stay out of this map.
+    static let snippetTemplates: [String: String] = [
+        "frac": "\\frac{}{}", "dfrac": "\\dfrac{}{}", "tfrac": "\\tfrac{}{}",
+        "binom": "\\binom{}{}", "dbinom": "\\dbinom{}{}", "tbinom": "\\tbinom{}{}",
+        "sqrt": "\\sqrt{}",
+        "textbf": "\\textbf{}", "textit": "\\textit{}", "texttt": "\\texttt{}",
+        "textsc": "\\textsc{}", "textrm": "\\textrm{}", "textsf": "\\textsf{}",
+        "textsl": "\\textsl{}", "textup": "\\textup{}", "emph": "\\emph{}",
+        "underline": "\\underline{}", "overline": "\\overline{}",
+        "mathbb": "\\mathbb{}", "mathbf": "\\mathbf{}", "mathcal": "\\mathcal{}",
+        "mathrm": "\\mathrm{}", "mathit": "\\mathit{}", "mathsf": "\\mathsf{}",
+        "mathtt": "\\mathtt{}", "mathfrak": "\\mathfrak{}",
+        "hat": "\\hat{}", "tilde": "\\tilde{}", "bar": "\\bar{}", "vec": "\\vec{}",
+        "dot": "\\dot{}", "ddot": "\\ddot{}", "widehat": "\\widehat{}", "widetilde": "\\widetilde{}",
+        "overrightarrow": "\\overrightarrow{}", "overleftarrow": "\\overleftarrow{}",
+        "section": "\\section{}", "subsection": "\\subsection{}", "subsubsection": "\\subsubsection{}",
+        "chapter": "\\chapter{}", "paragraph": "\\paragraph{}", "subparagraph": "\\subparagraph{}",
+        "part": "\\part{}",
+        "label": "\\label{}", "ref": "\\ref{}", "eqref": "\\eqref{}", "pageref": "\\pageref{}",
+        "cite": "\\cite{}", "citep": "\\citep{}", "citet": "\\citet{}",
+        "footnote": "\\footnote{}", "caption": "\\caption{}", "includegraphics": "\\includegraphics{}",
+        "textcolor": "\\textcolor{}{}", "colorbox": "\\colorbox{}{}",
+        "href": "\\href{}{}", "url": "\\url{}",
+        "newcommand": "\\newcommand{}{}", "renewcommand": "\\renewcommand{}{}",
+        "title": "\\title{}", "author": "\\author{}", "date": "\\date{}",
+        "usepackage": "\\usepackage{}", "documentclass": "\\documentclass{}",
+        "input": "\\input{}", "include": "\\include{}",
+        "multicolumn": "\\multicolumn{}{}{}", "multirow": "\\multirow{}{}{}",
+        "setlength": "\\setlength{}{}",
+    ]
+
     // texlab has no completion inside [] — supply common key=value option keys ourselves.
     static let optionKeys: [String] = [
         "width=", "height=", "scale=", "angle=", "trim=", "clip", "keepaspectratio",

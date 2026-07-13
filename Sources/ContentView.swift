@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var linter        = ChkTexLinter()
     @State private var texLabClient  = TexLabClient()
     @State private var shortcuts     = ShortcutStore.shared
+    @StateObject private var diagnostics = DiagnosticsStore()
+    @State private var showProblems  = false
     // true = editor/preview stacked top–bottom; false = side by side. Settings ⌘,.
     @AppStorage("previewSplitVertical") private var verticalSplit = false
     @AppStorage("showSidebar") private var showSidebar = true
@@ -14,6 +16,7 @@ struct ContentView: View {
     @AppStorage("splitFractionV") private var splitFractionV = 0.5   // editor share, stacked
 #if os(macOS)
     @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
+    @StateObject private var quickOpen = QuickOpenController()
 #endif
 
     var body: some View {
@@ -21,6 +24,13 @@ struct ContentView: View {
             .toolbar { toolbarContent }
             .task {
                 compiler.fileURL = fileURL
+                texLabClient.onDiagnostics = { diagnostics.setLSP($0) }
+                linter.onResults = { warnings in
+                    diagnostics.setChkTex(warnings.map {
+                        Diagnostic(source: .chktex, severity: $0.isError ? .error : .warning,
+                                   file: fileURL, line: $0.line, message: $0.message)
+                    })
+                }
 
                 // Start texlab LSP if file is saved
                 if let url = fileURL {
@@ -40,6 +50,13 @@ struct ContentView: View {
             }
             .onChange(of: fileURL) { _, url in
                 compiler.fileURL = url
+            }
+            .onChange(of: compiler.errorMessages) { _, msgs in
+                let diags = msgs.map {
+                    Diagnostic(source: .build, severity: .error, file: fileURL, line: $0.key, message: $0.value)
+                }
+                diagnostics.setBuild(diags)
+                if !diags.isEmpty { showProblems = true }
             }
             .onReceive(NotificationCenter.default.publisher(for: .iTexDidSave)) { _ in
                 // Compile-on-save (replaces per-keystroke compile).
@@ -64,8 +81,13 @@ struct ContentView: View {
             SidebarView(root: fileURL?.deletingLastPathComponent(), currentFile: fileURL)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
         } detail: {
-            editorPreviewSplit
-                .frame(minWidth: 560)
+            VStack(spacing: 0) {
+                editorPreviewSplit
+                if showProblems {
+                    ProblemsPanel(store: diagnostics, onJump: handleProblemJump)
+                }
+            }
+            .frame(minWidth: 560)
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 700, minHeight: 500)
@@ -74,8 +96,15 @@ struct ContentView: View {
                 .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
                 .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
         }
+        .background(WindowAccessor(rootKey: fileURL?.deletingLastPathComponent().standardizedFileURL.path ?? "none"))
         .onAppear { columnVisibility = showSidebar ? .all : .doubleColumn }
         .onChange(of: columnVisibility) { _, v in showSidebar = (v != .detailOnly) }
+        .sheet(isPresented: Binding(get: { quickOpen.isVisible },
+                                    set: { if !$0 { quickOpen.hide() } })) {
+            QuickOpenPalette(controller: quickOpen, onOpen: handleQuickOpen)
+        }
+        .focusedSceneValue(\.quickOpenAction, { quickOpen.show(root: fileURL?.deletingLastPathComponent()) })
+        .focusedSceneValue(\.problemsToggle, { showProblems.toggle() })
 #else
         HStack(spacing: 0) {
             EditorView(source: $document.source, compiler: compiler,
@@ -90,6 +119,36 @@ struct ContentView: View {
     private func toggleSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
             columnVisibility = (columnVisibility == .detailOnly) ? .doubleColumn : .detailOnly
+        }
+    }
+
+    /// Open a quick-open selection. A content hit (non-nil line) parks a PendingJump and posts a
+    /// jump notification so the editor lands on the line whether the document is new or already
+    /// open; a filename hit opens openable files as a tab or reveals the rest in Finder.
+    private func handleQuickOpen(_ url: URL, line: Int?) {
+        quickOpen.hide()
+        let ext = url.pathExtension.lowercased()
+        if let line {
+            PendingJump.shared.set(url, line: line)
+            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in
+                NotificationCenter.default.post(name: .iTexJumpToLine, object: nil,
+                                                userInfo: ["url": url, "line": line])
+            }
+        } else if QuickOpenController.openableExts.contains(ext) {
+            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+        } else {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    /// Jump to a diagnostic's file:line — reuses the quick-open content-hit path (park a
+    /// PendingJump, open the doc if needed, then post the jump notification).
+    private func handleProblemJump(_ d: Diagnostic) {
+        guard let url = d.file ?? fileURL else { return }
+        PendingJump.shared.set(url, line: d.line)
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in
+            NotificationCenter.default.post(name: .iTexJumpToLine, object: nil,
+                                            userInfo: ["url": url, "line": d.line])
         }
     }
 
@@ -108,16 +167,20 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .automatic) {
-            if !linter.warnings.isEmpty {
-                let errors   = linter.warnings.filter(\.isError).count
-                let warnings = linter.warnings.filter { !$0.isError }.count
+            let errors   = diagnostics.count(.error)
+            let warnings  = diagnostics.count(.warning)
+            Button { showProblems.toggle() } label: {
                 HStack(spacing: 4) {
-                    if errors   > 0 { Label("\(errors)",   systemImage: "xmark.circle.fill").foregroundStyle(.red) }
-                    if warnings > 0 { Label("\(warnings)", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                    if errors == 0 && warnings == 0 {
+                        Image(systemName: "checkmark.circle").foregroundStyle(.secondary)
+                    } else {
+                        if errors   > 0 { Label("\(errors)",   systemImage: "xmark.circle.fill").foregroundStyle(.red) }
+                        if warnings > 0 { Label("\(warnings)", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                    }
                 }
                 .font(.caption)
-                .help(linter.warnings.prefix(5).map { "L\($0.line): \($0.message)" }.joined(separator: "\n"))
             }
+            .help("Toggle Problems panel (⇧⌘M)")
         }
 #if os(macOS)
         ToolbarItem(placement: .automatic) {
@@ -159,6 +222,69 @@ struct ContentView: View {
 #if os(macOS)
 import AppKit
 import CoreServices
+import UniformTypeIdentifiers
+
+// MARK: - Folder-grouped native window tabs
+
+/// Groups document windows into native tabs by their .tex file's folder: every window gets
+/// `tabbingIdentifier = "itex::<folder>"`, so opening a document from the same folder lands as a
+/// tab in the existing window (adopting its exact frame so Magnet-style snaps survive); a
+/// different folder opens its own window. The Welcome window has no accessor → its own tab group.
+private struct WindowAccessor: NSViewRepresentable {
+    let rootKey: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(rootKey: rootKey) }
+
+    func makeNSView(context: Context) -> WindowReaderView {
+        let v = WindowReaderView()
+        let coord = context.coordinator
+        v.onWindow = { window in coord.attach(window) }
+        return v
+    }
+    func updateNSView(_ nsView: WindowReaderView, context: Context) {}
+
+    final class WindowReaderView: NSView {
+        var onWindow: ((NSWindow) -> Void)?
+        private var fired = false
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let w = window, !fired { fired = true; onWindow?(w) }
+        }
+    }
+
+    final class Coordinator {
+        private static let registry = NSHashTable<NSWindow>.weakObjects()
+        private let rootKey: String
+        init(rootKey: String) { self.rootKey = rootKey }
+
+        private var tabID: NSWindow.TabbingIdentifier { "itex::\(rootKey)" }
+
+        func attach(_ window: NSWindow) {
+            window.tabbingMode = .preferred
+            window.tabbingIdentifier = tabID
+            let host = existingHost(excluding: window)
+            Self.registry.add(window)
+            guard let host else { return }
+            let hostFrame = host.frame
+            if window.tabGroup !== host.tabGroup {
+                host.addTabbedWindow(window, ordered: .above)
+            }
+            window.setFrame(hostFrame, display: false)
+            window.makeKeyAndOrderFront(nil)
+            // A post-tab layout pass can nudge the group off its snap; re-assert once it settles.
+            DispatchQueue.main.async { [weak host, weak window] in
+                guard let host, let window else { return }
+                let f = host.frame
+                if window.frame != f { window.setFrame(f, display: false) }
+            }
+        }
+
+        private func existingHost(excluding window: NSWindow) -> NSWindow? {
+            let match: (NSWindow) -> Bool = { $0 !== window && $0.tabbingIdentifier == self.tabID }
+            return Self.registry.allObjects.first(where: match) ?? NSApp.windows.first(where: match)
+        }
+    }
+}
 
 // MARK: - Resizable split with a wide grab zone
 
@@ -280,6 +406,8 @@ private struct FileEntry: Identifiable {
     var id: URL { url }
 
     static let imageExts: Set<String> = ["png", "jpg", "jpeg", "pdf", "gif", "tiff", "tif", "bmp", "heic"]
+    // Extensions the app can open as documents (see CFBundleDocumentTypes: .tex + plain-text kin).
+    static let openableExts: Set<String> = ["tex", "bib", "sty", "cls", "txt", "md", "log"]
     var isImage: Bool { FileEntry.imageExts.contains(url.pathExtension.lowercased()) }
     var isTex: Bool { url.pathExtension.lowercased() == "tex" }
 
@@ -312,10 +440,16 @@ struct SidebarView: View {
         Group {
             if let root {
                 List(selection: $selection) {
-                    Section(root.lastPathComponent.removingPercentEncoding ?? root.lastPathComponent) {
+                    Section {
                         ForEach(FileEntry.children(of: root)) { entry in
                             FileRow(entry: entry, currentFile: currentFile, tree: tree)
                         }
+                    } header: {
+                        Text(root.lastPathComponent.removingPercentEncoding ?? root.lastPathComponent)
+                            .contextMenu {
+                                Button("New File…") { SidebarFileOps.newFile(in: root) }
+                                Button("New Folder…") { SidebarFileOps.newFolder(in: root) }
+                            }
                     }
                 }
                 .listStyle(.sidebar)
@@ -327,11 +461,17 @@ struct SidebarView: View {
         .onAppear { tree.watch(root); selection = currentFile }
         .onChange(of: root) { _, new in tree.watch(new) }
         .onChange(of: currentFile) { _, f in selection = f }
-        // Single click selects; an image selection previews it (reliable where a row
-        // TapGesture gets swallowed by the table's own mouse tracking).
+        // Single click selects; an image selection previews it, a supported document opens it as a
+        // tab (reliable where a row TapGesture gets swallowed by the table's own mouse tracking).
         .onChange(of: selection) { _, url in
-            guard let url, FileEntry.imageExts.contains(url.pathExtension.lowercased()) else { return }
-            preview = FileEntry(url: url, name: url.lastPathComponent, isDirectory: false)
+            guard let url else { return }
+            let ext = url.pathExtension.lowercased()
+            if FileEntry.imageExts.contains(ext) {
+                preview = FileEntry(url: url, name: url.lastPathComponent, isDirectory: false)
+            } else if FileEntry.openableExts.contains(ext),
+                      url.standardizedFileURL != currentFile?.standardizedFileURL {
+                NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+            }
         }
         .popover(item: $preview) { entry in
             if let img = NSImage(contentsOf: entry.url) {
@@ -364,18 +504,23 @@ private struct FileRow: View {
         currentFile?.standardizedFileURL == entry.url.standardizedFileURL
     }
 
+    @State private var dropTargeted = false
+
     var body: some View {
         if entry.isDirectory {
             DisclosureGroup(isExpanded: expandedBinding) {
                 ForEach(children) { FileRow(entry: $0, currentFile: currentFile, tree: tree) }
             } label: {
                 Label(entry.name, systemImage: "folder").lineLimit(1)
+                    .background(dropTargeted ? Color.accentColor.opacity(0.18) : Color.clear)
+                    .onDrag { NSItemProvider(object: entry.url as NSURL) }
+                    .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { handleDrop($0) }
             }
             .tag(entry.url)
             .onAppear { reloadChildrenIfExpanded() }
             .onChange(of: expansion.expanded) { _, _ in reloadChildrenIfExpanded() }
             .onChange(of: tree.version) { _, _ in reloadChildrenIfExpanded() }
-            .contextMenu { revealButton }
+            .contextMenu { menuItems }
         } else {
             Label {
                 Text(entry.name).lineLimit(1)
@@ -385,12 +530,146 @@ private struct FileRow: View {
             }
             .fontWeight(isCurrent ? .semibold : .regular)
             .tag(entry.url)
-            .contextMenu { revealButton }
+            .onDrag { NSItemProvider(object: entry.url as NSURL) }
+            .contextMenu { menuItems }
         }
     }
 
-    private var revealButton: some View {
+    @ViewBuilder private var menuItems: some View {
+        if entry.isDirectory {
+            Button("New File…") { SidebarFileOps.newFile(in: entry.url) }
+            Button("New Folder…") { SidebarFileOps.newFolder(in: entry.url) }
+            Divider()
+        }
+        Button("Rename…") { SidebarFileOps.promptRename(entry.url) }
+        Button("Delete") { SidebarFileOps.delete(entry.url) }
+        Divider()
         Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
+    }
+
+    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        var handled = false
+        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            handled = true
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                guard let data = item as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async { SidebarFileOps.move(url, into: entry.url) }
+            }
+        }
+        return handled
+    }
+}
+
+// MARK: - Sidebar file operations (FileManager-based; FSEvents refreshes the tree)
+
+private enum SidebarFileOps {
+    static func newFile(in dir: URL) {
+        let url = uniqueURL(in: dir, base: "Untitled", ext: "tex")
+        do {
+            try Data().write(to: url, options: .withoutOverwriting)
+            promptRename(url)
+        } catch { warn("Couldn't create the file.", error) }
+    }
+
+    static func newFolder(in dir: URL) {
+        let url = uniqueURL(in: dir, base: "Untitled Folder", ext: "")
+        do {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+            promptRename(url)
+        } catch { warn("Couldn't create the folder.", error) }
+    }
+
+    static func promptRename(_ url: URL) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Rename"
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+            field.stringValue = url.lastPathComponent
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Rename")
+            alert.addButton(withTitle: "Cancel")
+            alert.window.initialFirstResponder = field
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, name != url.lastPathComponent else { return }
+            let dest = url.deletingLastPathComponent().appendingPathComponent(name)
+            guard !FileManager.default.fileExists(atPath: dest.path) else {
+                NSSound.beep(); warn("An item named “\(name)” already exists."); return
+            }
+            do { try FileManager.default.moveItem(at: url, to: dest) }
+            catch { NSSound.beep(); warn("Couldn't rename the item.", error) }
+        }
+    }
+
+    static func delete(_ url: URL) {
+        if openConflict(url) { blocked(url, verb: "deleted"); return }
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Move “\(url.lastPathComponent)” to the Trash?"
+            alert.informativeText = "You can restore it from the Trash later."
+            alert.addButton(withTitle: "Move to Trash")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            do { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+            catch { NSSound.beep(); warn("Couldn't move the item to the Trash.", error) }
+        }
+    }
+
+    static func move(_ src: URL, into folder: URL) {
+        let s = src.standardizedFileURL, d = folder.standardizedFileURL
+        guard d != s, !d.path.hasPrefix(s.path + "/") else { NSSound.beep(); return }   // no folder-into-descendant
+        guard s.deletingLastPathComponent() != d else { return }                        // already in this folder
+        let dest = d.appendingPathComponent(s.lastPathComponent)
+        guard !FileManager.default.fileExists(atPath: dest.path) else {
+            NSSound.beep()
+            warn("An item named “\(s.lastPathComponent)” already exists in “\(d.lastPathComponent)”.")
+            return
+        }
+        do { try FileManager.default.moveItem(at: s, to: dest) }
+        catch { NSSound.beep(); warn("Couldn't move the item.", error) }
+    }
+
+    private static func uniqueURL(in dir: URL, base: String, ext: String) -> URL {
+        let fm = FileManager.default
+        func candidate(_ n: Int) -> URL {
+            let stem = n == 1 ? base : "\(base) \(n)"
+            return dir.appendingPathComponent(ext.isEmpty ? stem : "\(stem).\(ext)")
+        }
+        var n = 1, url = candidate(n)
+        while fm.fileExists(atPath: url.path) { n += 1; url = candidate(n) }
+        return url
+    }
+
+    /// True when `url` is a file open in any window, or a folder that contains one — trashing it
+    /// would delete a document out from under its window, so delete is blocked in that case.
+    /// (Rename/move are allowed: NSDocument follows moves on disk and keeps saving correctly.)
+    private static func openConflict(_ url: URL) -> Bool {
+        let p = url.standardizedFileURL.path
+        return NSDocumentController.shared.documents.contains { doc in
+            guard let f = doc.fileURL?.standardizedFileURL.path else { return false }
+            return f == p || f.hasPrefix(p + "/")
+        }
+    }
+
+    private static func blocked(_ url: URL, verb: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "“\(url.lastPathComponent)” is open and can't be \(verb)."
+            alert.informativeText = "Close its window first."
+            alert.runModal()
+        }
+    }
+
+    private static func warn(_ message: String, _ error: Error? = nil) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = message
+            if let error { alert.informativeText = error.localizedDescription }
+            alert.runModal()
+        }
     }
 }
 #endif

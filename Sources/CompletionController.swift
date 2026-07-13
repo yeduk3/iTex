@@ -5,6 +5,7 @@ import AppKit
 struct CompletionItem: Equatable {
     let display: String   // shown in the list (commands include the leading backslash)
     let insert: String    // text inserted over the current word range
+    var snippet: String? = nil   // LSP snippet source ($1/${1:..}) when present; nil = plain / static
 }
 
 /// Non-activating panel so the text view keeps first-responder status while the list is up —

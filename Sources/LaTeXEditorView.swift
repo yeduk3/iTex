@@ -2,6 +2,7 @@ import SwiftUI
 
 #if os(macOS)
 import AppKit
+import Combine
 
 // MARK: - NSTextView subclass
 
@@ -47,6 +48,13 @@ final class LaTeXTextView: NSTextView {
     private var completionTask: Task<Void, Never>?
     private var isApplyingEdit = false
 
+    // MARK: - Snippet session (tab-stop navigation after accepting a completion)
+    private var snippetStops: [SnippetStop] = []   // active stops, ranges in document coordinates
+    private var snippetRange = NSRange(location: 0, length: 0)   // whole snippet span
+    private var snippetFinal = 0                    // $0 position (document coordinate)
+    private var snippetCurrent = -1
+    private var snippetActive = false
+
     /// Invalidate any in-flight texlab request so a late reply can't re-open the popup.
     private func cancelPendingCompletion() {
         completionTask?.cancel()
@@ -64,21 +72,33 @@ final class LaTeXTextView: NSTextView {
     }
 
     private func buildCandidates(_ ctx: CompletionContext, prefix: String) -> [CompletionItem] {
-        let server = (delegate as? Coordinator)?.texLabClient?.latestCompletions.map(\.label) ?? []
-        let raw: [String]
+        let server = (delegate as? Coordinator)?.texLabClient?.latestCompletions ?? []
+        var seen = Set<String>(), out: [CompletionItem] = []
+        func add(_ display: String, snippet: String? = nil) {
+            guard display.hasPrefix(prefix), display != prefix, seen.insert(display).inserted else { return }
+            out.append(CompletionItem(display: display, insert: display, snippet: snippet))
+        }
         switch ctx {
         case .command, .none:
-            raw = server.map { "\\" + $0 } + LaTeXCommands.environments.map { "\\" + $0 } + LaTeXCommands.all
+            for c in server { add("\\" + c.label, snippet: lspSnippet(c.insertText, command: true)) }
+            for e in LaTeXCommands.environments { add("\\" + e) }
+            for s in LaTeXCommands.all { add(s) }
         case .brace:
-            raw = server
+            for c in server { add(c.label, snippet: lspSnippet(c.insertText, command: false)) }
         case .option:
-            raw = LaTeXCommands.optionKeys
-        }
-        var seen = Set<String>(), out: [CompletionItem] = []
-        for s in raw where s.hasPrefix(prefix) && s != prefix && seen.insert(s).inserted {
-            out.append(CompletionItem(display: s, insert: s))
+            for k in LaTeXCommands.optionKeys { add(k) }
         }
         return out
+    }
+
+    /// Keep an LSP snippet only when it actually carries placeholders; re-anchor the leading
+    /// backslash for command context (our word range includes it, texlab's newText does not).
+    private func lspSnippet(_ insertText: String, command: Bool) -> String? {
+        guard insertText.contains("$") else { return nil }
+        guard command else { return insertText }
+        var s = insertText
+        if s.hasPrefix("\\") { s.removeFirst() }
+        return "\\" + s
     }
 
     /// Re-filter from the cache and show/update the popup instantly — no server round-trip.
@@ -122,9 +142,20 @@ final class LaTeXTextView: NSTextView {
     }
 
     /// Caret moved (click / arrow / edit) → dismiss the error popover; dismiss completion on non-edit moves.
+    private var highlightLineRect: NSRect?
     func handleSelectionChange() {
         errorPopover.close()
+        // Caret leaving the snippet's overall span ends the session (programmatic stop moves stay inside).
+        if snippetActive {
+            let sel = selectedRange()
+            if sel.location < snippetRange.location || NSMaxRange(sel) > NSMaxRange(snippetRange) { endSnippetSession() }
+        }
         if !isApplyingEdit, completion.isVisible { completion.close() }
+        // Move the current-line highlight: repaint the old line and the new one.
+        let newRect = currentLineFragmentRect()
+        if let old = highlightLineRect { setNeedsDisplay(old) }
+        if let new = newRect { setNeedsDisplay(new) }
+        highlightLineRect = newRect
     }
 
     /// Accept the highlighted item. A wrappable environment expands straight to
@@ -134,8 +165,104 @@ final class LaTeXTextView: NSTextView {
             expandEnvironment(String(item.insert.dropFirst()), replacing: completionWordRange)
             return
         }
-        replace(range: completionWordRange, with: item.insert,
-                newSelection: NSRange(location: completionWordRange.location + (item.insert as NSString).length, length: 0))
+        let snippet = snippetForItem(item)
+        if let snippet, snippet.hasStops {
+            beginSnippetSession(snippet, replacing: completionWordRange)
+            return
+        }
+        let text = snippet?.text ?? item.insert
+        let caret = completionWordRange.location + (snippet?.finalCaret ?? (item.insert as NSString).length)
+        replace(range: completionWordRange, with: text, newSelection: NSRange(location: caret, length: 0))
+    }
+
+    /// Snippet for an accepted item: an explicit LSP snippet, else a static brace template, else
+    /// any empty brace groups already in the insert text. nil → plain insert.
+    private func snippetForItem(_ item: CompletionItem) -> Snippet? {
+        if let src = item.snippet { return Snippet.parse(src) }
+        if item.insert.hasPrefix("\\"),
+           let tmpl = LaTeXCommands.snippetTemplates[String(item.insert.dropFirst())] {
+            return Snippet.fromEmptyGroups(tmpl)
+        }
+        return Snippet.fromEmptyGroups(item.insert)
+    }
+
+    // MARK: - Snippet session
+
+    /// Insert the snippet as one undo step, re-base stops into document coordinates, select the first.
+    private func beginSnippetSession(_ snippet: Snippet, replacing range: NSRange) {
+        endSnippetSession()
+        let base = range.location
+        guard replace(range: range, with: snippet.text, newSelection: NSRange(location: base, length: 0)) else { return }
+        snippetStops = snippet.stops.map {
+            SnippetStop(index: $0.index,
+                        range: NSRange(location: base + $0.range.location, length: $0.range.length),
+                        placeholder: $0.placeholder)
+        }
+        snippetRange = NSRange(location: base, length: (snippet.text as NSString).length)
+        snippetFinal = base + snippet.finalCaret
+        snippetCurrent = -1
+        snippetActive = true
+        moveToSnippetStop(0)
+    }
+
+    /// Select stop `i`; past the last stop lands on `$0` and ends the session.
+    private func moveToSnippetStop(_ i: Int) {
+        guard snippetActive else { return }
+        let len = (string as NSString).length
+        if i >= snippetStops.count {
+            let caret = min(snippetFinal, len)
+            endSnippetSession()
+            setSelectedRange(NSRange(location: caret, length: 0))
+            return
+        }
+        snippetCurrent = max(0, i)
+        let r = snippetStops[snippetCurrent].range
+        let loc = min(r.location, len)
+        let clamped = NSRange(location: loc, length: min(r.length, max(0, len - loc)))
+        setSelectedRange(clamped)
+        scrollRangeToVisible(clamped)
+    }
+
+    private func advanceSnippet(forward: Bool) {
+        moveToSnippetStop(forward ? snippetCurrent + 1 : max(0, snippetCurrent - 1))
+    }
+
+    /// Teardown touches no text — only session bookkeeping is cleared.
+    func endSnippetSession() {
+        guard snippetActive else { return }
+        snippetActive = false
+        snippetStops = []
+        snippetCurrent = -1
+        snippetRange = NSRange(location: 0, length: 0)
+        snippetFinal = 0
+    }
+
+    /// Re-flow stop / range bookkeeping for a pending edit (called from shouldChangeText, before
+    /// the text mutates, so ranges are correct once it lands).
+    private func adjustSnippet(edit: NSRange, replacementLength newLength: Int) {
+        let s = edit.location, e = edit.location + edit.length
+        let delta = newLength - edit.length
+        for k in snippetStops.indices {
+            var r = snippetStops[k].range
+            let a = r.location, b = r.location + r.length
+            if k == snippetCurrent {
+                if e <= a { r.location += delta }               // before the active stop
+                else if s > b { }                               // after it
+                else if s >= a { r.length = max(0, r.length + delta) }   // inside → grow/shrink
+                else { r.location = s; r.length = max(0, b + delta - s) } // spans its start
+            } else {
+                if e <= a { r.location += delta }
+                else if s >= b { }                              // wholly after
+                else { r.length = max(0, r.length + delta) }
+            }
+            snippetStops[k].range = r
+        }
+        let ra = snippetRange.location, rb = ra + snippetRange.length
+        if e <= ra { snippetRange.location += delta }
+        else if s > rb { }
+        else { snippetRange.length = max(0, snippetRange.length + delta) }
+        if e <= snippetFinal { snippetFinal += delta }
+        else if s < snippetFinal { snippetFinal = s + newLength }
     }
 
     private func lspPosition(in text: String, at loc: Int) -> (Int, Int) {
@@ -166,7 +293,29 @@ final class LaTeXTextView: NSTextView {
                 openLine(above: f.contains(.shift)); return true
             }
         }
+        // ⇧⌘K delete the caret line / every line the selection touches (VSCode).
+        if !hasMarkedText(), event.keyCode == 40 {
+            let f = event.modifierFlags
+            if f.contains(.command) && f.contains(.shift) && !f.contains(.option) && !f.contains(.control) {
+                deleteCurrentLines(); return true
+            }
+        }
         return super.performKeyEquivalent(with: event)
+    }
+
+    // Route the stock Find menu / ⌘F to our own find bar so the system find bar never opens.
+    override func performFindPanelAction(_ sender: Any?) {
+        guard let find = (delegate as? Coordinator)?.find else { return }
+        switch (sender as? NSMenuItem)?.tag {
+        case 2: find.next()      // NSFindPanelAction.next
+        case 3: find.prev()      // NSFindPanelAction.previous
+        default: find.show()     // showFindPanel + everything else
+        }
+    }
+
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(performFindPanelAction(_:)) { return true }
+        return super.validateUserInterfaceItem(item)
     }
 
     // Insert a blank line above/below the caret's line (matching its indent) and move the caret onto it.
@@ -200,6 +349,8 @@ final class LaTeXTextView: NSTextView {
         if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return
         }
+        // Esc ends an active snippet session (the popup, if open, swallows Esc before keyDown).
+        if !hasMarkedText(), event.keyCode == 53, snippetActive { endSnippetSession(); return }
         // ⌥↑ / ⌥↓ move the line (or selected lines); ⌥⇧↑ / ⌥⇧↓ duplicate them.
         if !hasMarkedText() {
             let f = event.modifierFlags
@@ -276,6 +427,29 @@ final class LaTeXTextView: NSTextView {
                 newSelection: NSRange(location: newBlockStart + offset, length: sel.length))
     }
 
+    // Delete the full lines the selection touches as one undo step; caret lands at the same
+    // column on the line that follows (clamped to its length), or the doc end.
+    private func deleteCurrentLines() {
+        let ns = string as NSString
+        guard ns.length > 0 else { NSSound.beep(); return }
+        let sel = selectedRange()
+        let block = ns.lineRange(for: sel)
+        let column = sel.location - block.location
+
+        var range = block
+        // Final line without a trailing newline: swallow the preceding \n so no blank line is left.
+        if NSMaxRange(block) == ns.length, block.location > 0, ns.character(at: NSMaxRange(block) - 1) != 0x0A {
+            range = NSRange(location: block.location - 1, length: block.length + 1)
+        }
+        let after = ns.replacingCharacters(in: range, with: "") as NSString
+        let base = min(range.location, after.length)
+        let line = after.lineRange(for: NSRange(location: base, length: 0))
+        let hasNL = base < after.length && after.character(at: NSMaxRange(line) - 1) == 0x0A
+        let content = line.length - (hasNL ? 1 : 0)
+        let caret = min(base + min(column, content), after.length)
+        replace(range: range, with: "", newSelection: NSRange(location: caret, length: 0))
+    }
+
     /// Run an editor-owned command; false for commands handled elsewhere (build/sync via SwiftUI buttons).
     private func runEditorCommand(_ cmd: AppCommand) -> Bool {
         switch cmd {
@@ -288,6 +462,7 @@ final class LaTeXTextView: NSTextView {
     // Tab: indent selection / wrap `\env` in begin-end / insert 2 spaces
     override func insertTab(_ sender: Any?) {
         if hasMarkedText() { super.insertTab(sender); return }
+        if snippetActive { advanceSnippet(forward: true); return }
         if selectedRange().length > 0 { indentSelection(); return }
         if let (range, name) = environmentCommandBeforeCursor() {
             expandEnvironment(name, replacing: range); return
@@ -295,9 +470,10 @@ final class LaTeXTextView: NSTextView {
         insertText(indentUnit, replacementRange: selectedRange())
     }
 
-    // Shift+Tab: dedent
+    // Shift+Tab: previous snippet stop / dedent
     override func insertBacktab(_ sender: Any?) {
         if hasMarkedText() { super.insertBacktab(sender); return }
+        if snippetActive { advanceSnippet(forward: false); return }
         dedentSelection()
     }
 
@@ -395,6 +571,31 @@ final class LaTeXTextView: NSTextView {
         }
         if !handled { super.deleteBackward(sender) }
         if completion.isVisible { updateCompletionAfterEdit() }
+    }
+
+    // Every committed edit re-flows active snippet stops. Skip while composing (marked text): the
+    // edit is transient and setMarkedText already ended any session it touched.
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+        if ok, snippetActive, !hasMarkedText(), let repl = replacementString {
+            adjustSnippet(edit: affectedCharRange, replacementLength: (repl as NSString).length)
+        }
+        return ok
+    }
+
+    // IME composition inside the snippet would corrupt range bookkeeping → end the session (text
+    // stays intact); safe degradation over corruption.
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if snippetActive {
+            let loc = replacementRange.location != NSNotFound ? replacementRange.location : self.selectedRange().location
+            if loc >= snippetRange.location, loc <= NSMaxRange(snippetRange) { endSnippetSession() }
+        }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        endSnippetSession()
+        return super.resignFirstResponder()
     }
 
     // MARK: helpers
@@ -567,6 +768,11 @@ final class LaTeXTextView: NSTextView {
 
     override func drawBackground(in rect: NSRect) {
         super.drawBackground(in: rect)
+        // Current-line highlight (caret only, no range) — drawn under the red error shading.
+        if selectedRange().length == 0, let r = currentLineFragmentRect() {
+            NSColor.selectedTextBackgroundColor.withAlphaComponent(0.12).setFill()
+            r.fill()
+        }
         guard !errorInfo.isEmpty, let lm = layoutManager, let tc = textContainer else { return }
         NSColor.systemRed.withAlphaComponent(0.12).setFill()
         for line in errorInfo.keys {
@@ -576,6 +782,31 @@ final class LaTeXTextView: NSTextView {
             r.size.width = bounds.width
             r.fill()
         }
+    }
+
+    /// Full-width rect of the caret's line fragment (view coordinates), for the current-line highlight.
+    private func currentLineFragmentRect() -> NSRect? {
+        guard let lm = layoutManager else { return nil }
+        let ns = string as NSString
+        let loc = min(selectedRange().location, ns.length)
+        var rect: NSRect
+        if loc >= ns.length {                                       // caret at end of document
+            if ns.length == 0 || ns.character(at: ns.length - 1) == 0x0A {
+                rect = lm.extraLineFragmentRect
+            } else {
+                let g = lm.glyphRange(forCharacterRange: NSRange(location: ns.length - 1, length: 1),
+                                      actualCharacterRange: nil).location
+                rect = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+            }
+        } else {
+            let g = lm.glyphRange(forCharacterRange: NSRange(location: loc, length: 0),
+                                  actualCharacterRange: nil).location
+            rect = lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+        }
+        rect.origin.x = 0
+        rect.origin.y += textContainerOrigin.y
+        rect.size.width = bounds.width
+        return rect
     }
 
     /// Bounding rect of a 1-based source line in view coordinates.
@@ -685,8 +916,15 @@ struct LaTeXEditorView: NSViewRepresentable {
     var selectReq: SelectLineRequest?    // diffed so updateNSView runs on inverse search / scroll-sync
     var scrollReq: SelectLineRequest?
     var tabWidth: Int = 2                 // tab render width in spaces (Settings)
+    var fontScale: Double = 1.0           // editor zoom (⌘+/⌘-/⌘0 via FontScale)
+    var find: FindController?             // in-file find/replace bar (⌘F)
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    /// Monospaced editor font at the current zoom; the gutter and tab width follow it.
+    static func editorFont(scale: Double) -> NSFont {
+        .monospacedSystemFont(ofSize: FontScale.baseSize * CGFloat(scale), weight: .regular)
+    }
 
     /// Paragraph style that renders a tab at `tabWidth` space-widths (no wide default tab stops).
     private func tabParagraphStyle(font: NSFont) -> NSParagraphStyle {
@@ -724,14 +962,16 @@ struct LaTeXEditorView: NSViewRepresentable {
         tv.allowsUndo      = true
         tv.isRichText      = false
         tv.usesFontPanel   = false
-        tv.usesRuler       = false
-        tv.font            = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        tv.usesRuler       = true
+        let editorFont     = LaTeXEditorView.editorFont(scale: fontScale)
+        tv.font            = editorFont
         // Render a tab at `tabWidth` space-widths instead of the wide default tab stop.
-        let tabStyle = tabParagraphStyle(font: tv.font!)
+        let tabStyle = tabParagraphStyle(font: editorFont)
         tv.defaultParagraphStyle = tabStyle
         tv.typingAttributes[.paragraphStyle] = tabStyle
         context.coordinator.tabStyle = tabStyle
         context.coordinator.appliedTabWidth = tabWidth
+        context.coordinator.appliedFontScale = fontScale
         tv.isAutomaticQuoteSubstitutionEnabled  = false
         tv.isAutomaticDashSubstitutionEnabled   = false
         tv.isAutomaticSpellingCorrectionEnabled = false
@@ -750,6 +990,17 @@ struct LaTeXEditorView: NSViewRepresentable {
         scrollView.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(context.coordinator, selector: #selector(Coordinator.editorScrolled),
                                                name: NSView.boundsDidChangeNotification, object: scrollView.contentView)
+        // Quick-open content hit → jump to line when this document is already open in some window.
+        NotificationCenter.default.addObserver(context.coordinator, selector: #selector(Coordinator.handleJumpNotification(_:)),
+                                               name: .iTexJumpToLine, object: nil)
+
+        // Line-number gutter in the vertical ruler.
+        scrollView.hasVerticalRuler   = true
+        scrollView.hasHorizontalRuler = false
+        scrollView.rulersVisible      = true
+        let ruler = LineNumberRuler(textView: tv, scrollView: scrollView)
+        scrollView.verticalRulerView  = ruler
+        context.coordinator.lineRuler = ruler
         return scrollView
     }
 
@@ -757,22 +1008,31 @@ struct LaTeXEditorView: NSViewRepresentable {
         guard let tv = scrollView.documentView as? LaTeXTextView else { return }
         context.coordinator.texLabClient = texLabClient   // keep in sync
         context.coordinator.compiler = compiler
-        if context.coordinator.appliedTabWidth != tabWidth, let font = tv.font {   // Settings changed tab width
-            let style = tabParagraphStyle(font: font)
+        let scaleChanged = context.coordinator.appliedFontScale != fontScale
+        if scaleChanged || context.coordinator.appliedTabWidth != tabWidth {   // Settings changed font size / tab width
+            let font = LaTeXEditorView.editorFont(scale: fontScale)
+            if scaleChanged { tv.font = font }                                 // applies to the whole text storage
+            let style = tabParagraphStyle(font: font)                          // tab width is space-relative → recompute
             tv.defaultParagraphStyle = style
             tv.typingAttributes[.paragraphStyle] = style
+            tv.typingAttributes[.font] = font
             context.coordinator.tabStyle = style
             context.coordinator.appliedTabWidth = tabWidth
+            context.coordinator.appliedFontScale = fontScale
             tv.textStorage?.addAttribute(.paragraphStyle, value: style,
                 range: NSRange(location: 0, length: (tv.string as NSString).length))
+            context.coordinator.lineRuler?.refresh()
         }
         if tv.string != text {
+            tv.endSnippetSession()   // outside edit replaced the buffer → any session's ranges are void
             tv.string = text
             if let style = context.coordinator.tabStyle {   // string setter drops paragraph style; reapply
                 tv.textStorage?.addAttribute(.paragraphStyle, value: style,
                     range: NSRange(location: 0, length: (text as NSString).length))
             }
             if let lm = tv.layoutManager { Syntax.apply(to: lm, string: text) }
+            context.coordinator.findMatchesStale = true   // ranges shifted → recompute find on next pass
+            context.coordinator.lineRuler?.refresh()      // direct string set posts no didChange notification
         }
         tv.errorInfo = errorMessages      // light-red background + hover/⌘. message popover
         // SyncTeX inverse search (⌘-click): select the requested source line once per request.
@@ -790,6 +1050,13 @@ struct LaTeXEditorView: NSViewRepresentable {
             compiler?.beginSyncCooldown()
             tv.centerLine(req.line)
         }
+        // Quick-open content hit into a freshly-opened document: consume its parked jump once the
+        // text is in place (take() removes it, so re-runs of updateNSView don't re-jump).
+        if let url = compiler?.fileURL, let line = PendingJump.shared.take(url) {
+            context.coordinator.performJump(to: line)
+        }
+        context.coordinator.bindFind(find)
+        context.coordinator.applyFind(find)
     }
 }
 
@@ -804,12 +1071,46 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     var lastScrollLineToken = -1
     var tabStyle: NSParagraphStyle?
     var appliedTabWidth = -1
+    var appliedFontScale = -1.0
+    weak var lineRuler: LineNumberRuler?
     private var scrollWork: DispatchWorkItem?
+
+    // Find/replace state (single source of truth is the FindController; these mirror it for logic).
+    var find: FindController?
+    private var findSubscription: AnyCancellable?
+    private var findMatches: [NSRange] = []
+    private var findCurrent = 0
+    var findMatchesStale = false
+    private var findLastVisible = false
+    private var findLastQuery = ""
+    private var findLastCase = false
+    private var findLastNav = 0
+    private var findLastReplaceToken = 0
 
     init(_ parent: LaTeXEditorView) {
         self.parent = parent
         self.texLabClient = parent.texLabClient
         self.compiler = parent.compiler
+    }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
+
+    // Quick-open content hit: select the 1-based line and scroll it into view (mirrors the
+    // SyncTeX inverse-search select path).
+    func performJump(to line: Int) {
+        guard let tv = textView, let range = LaTeXEditorView.range(ofLine: line, in: tv.string) else { return }
+        tv.setSelectedRange(range)
+        tv.scrollRangeToVisible(range)
+        tv.window?.makeFirstResponder(tv)
+    }
+
+    // A quick-open content hit was opened elsewhere; if it's this window's file, jump to the line.
+    @MainActor @objc func handleJumpNotification(_ note: Notification) {
+        guard let url = note.userInfo?["url"] as? URL,
+              let line = note.userInfo?["line"] as? Int,
+              url.standardizedFileURL == compiler?.fileURL?.standardizedFileURL else { return }
+        _ = PendingJump.shared.take(url)   // clear the parked jump so it isn't consumed twice
+        performJump(to: line)
     }
 
     // Scroll-sync (editor → PDF): center the PDF on the editor's center line, debounced.
@@ -828,6 +1129,7 @@ final class Coordinator: NSObject, NSTextViewDelegate {
         guard let tv = notification.object as? NSTextView else { return }
         parent.text = tv.string
         if let lm = tv.layoutManager { Syntax.apply(to: lm, string: tv.string) }
+        findMatchesStale = true   // ranges shifted; recompute on the next applyFind pass
     }
 
     // Track cursor line for SyncTeX; dismiss the completion popup on a non-edit caret move.
@@ -838,6 +1140,185 @@ final class Coordinator: NSObject, NSTextViewDelegate {
         let ns = tv.string as NSString
         let loc = min(tv.selectedRange().location, ns.length)
         compiler.cursorLine = ns.substring(to: loc).components(separatedBy: "\n").count
+    }
+
+    // MARK: - Find / replace
+    //
+    // Find highlights live as *temporary* `.backgroundColor` attributes on the layout manager.
+    // Syntax highlighting (Syntax.apply) only touches temporary `.foregroundColor` — it removes
+    // and re-adds that key alone and never clears `.backgroundColor` — so the two passes are
+    // orthogonal: a syntax re-run on every edit leaves find highlights intact, and the find pass
+    // never disturbs the token colors. Only the match *ranges* go stale on edits, so a text
+    // change flags `findMatchesStale` and the next applyFind recomputes + repaints them.
+
+    /// Observe the controller directly: SwiftUI skips updateNSView when the representable's
+    /// stored properties are unchanged (the controller is the same reference), so bar-driven
+    /// state changes (query typing, Esc close, nav) would otherwise never reach applyFind.
+    func bindFind(_ find: FindController?) {
+        if self.find !== find {
+            self.find = find
+            findSubscription = find?.objectWillChange.sink { [weak self] _ in
+                DispatchQueue.main.async { self?.applyFind(self?.find) }
+            }
+        }
+    }
+
+    func applyFind(_ find: FindController?) {
+        guard let find, let tv = textView else { return }
+
+        // Replace requests arrive as a bumped replaceToken; handle and return so the normal
+        // find/nav pass doesn't also run.
+        if find.replaceToken != findLastReplaceToken {
+            findLastReplaceToken = find.replaceToken
+            guard find.isVisible, !find.query.isEmpty else { return }
+            if find.replaceAllRequested { replaceAllFind(tv, find) } else { replaceOnceFind(tv, find) }
+            return
+        }
+
+        let becameVisible = find.isVisible && !findLastVisible
+        let queryChanged  = find.query != findLastQuery || find.caseSensitive != findLastCase
+        let navChanged    = find.navToken != findLastNav
+        let wasVisible    = findLastVisible
+        findLastVisible = find.isVisible
+        findLastQuery   = find.query
+        findLastCase    = find.caseSensitive
+        findLastNav     = find.navToken
+
+        guard find.isVisible else {
+            if wasVisible {                                   // bar closed → clean up + hand focus back
+                clearFindHighlights(tv)
+                publishFind(find)
+                DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            }
+            return
+        }
+        if becameVisible { prefillFind(find, tv) }
+        guard becameVisible || queryChanged || navChanged || findMatchesStale else { return }
+        guard !find.query.isEmpty else {
+            findMatches = []; findCurrent = 0
+            clearFindHighlights(tv); publishFind(find); return
+        }
+
+        if becameVisible || queryChanged || findMatchesStale {
+            recomputeFind(tv, query: find.query, caseSensitive: find.caseSensitive)
+            if becameVisible || queryChanged {                // land on the match at/after the caret
+                let caret = tv.selectedRange().location
+                findCurrent = findMatches.firstIndex(where: { $0.location >= caret }) ?? 0
+            }
+        }
+        if navChanged, !findMatches.isEmpty {
+            findCurrent = find.backwards ? (findCurrent - 1 + findMatches.count) % findMatches.count
+                                         : (findCurrent + 1) % findMatches.count
+        }
+        findCurrent = findMatches.isEmpty ? 0 : min(findCurrent, findMatches.count - 1)
+        highlightFind(tv)
+        // Don't yank the viewport on a bare text edit (matchesStale only) — that would fight a
+        // caret the user is driving in the editor with the bar open.
+        if (becameVisible || queryChanged || navChanged), !findMatches.isEmpty { jumpToCurrentFind(tv) }
+        publishFind(find)
+    }
+
+    private func recomputeFind(_ tv: NSTextView, query: String, caseSensitive: Bool) {
+        findMatches = []
+        findMatchesStale = false
+        findLastQuery = query
+        findLastCase = caseSensitive
+        guard !query.isEmpty else { return }
+        let s = tv.string as NSString
+        let opts: NSString.CompareOptions = caseSensitive ? [] : [.caseInsensitive]
+        var loc = 0
+        while loc < s.length {
+            let r = s.range(of: query, options: opts, range: NSRange(location: loc, length: s.length - loc))
+            if r.location == NSNotFound { break }
+            findMatches.append(r)
+            loc = r.location + max(1, r.length)
+        }
+    }
+
+    private func highlightFind(_ tv: NSTextView) {
+        guard let lm = tv.layoutManager else { return }
+        let full = NSRange(location: 0, length: (tv.string as NSString).length)
+        lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: full)
+        for (i, r) in findMatches.enumerated() where NSMaxRange(r) <= full.length {
+            let color = (i == findCurrent)
+                ? NSColor.findHighlightColor
+                : NSColor.findHighlightColor.withAlphaComponent(0.35)
+            lm.addTemporaryAttribute(.backgroundColor, value: color, forCharacterRange: r)
+        }
+    }
+
+    private func clearFindHighlights(_ tv: NSTextView) {
+        guard let lm = tv.layoutManager else { return }
+        let full = NSRange(location: 0, length: (tv.string as NSString).length)
+        lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: full)
+    }
+
+    private func jumpToCurrentFind(_ tv: NSTextView) {
+        guard findCurrent < findMatches.count else { return }
+        let r = findMatches[findCurrent]
+        tv.setSelectedRange(r)
+        tv.scrollRangeToVisible(r)
+    }
+
+    /// Replace the current match (literal), then advance so the next match becomes current.
+    private func replaceOnceFind(_ tv: NSTextView, _ find: FindController) {
+        if findMatchesStale || findMatches.isEmpty {
+            recomputeFind(tv, query: find.query, caseSensitive: find.caseSensitive)
+        }
+        guard !findMatches.isEmpty, findCurrent < findMatches.count else { publishFind(find); return }
+        let r = findMatches[findCurrent]
+        replaceRange(tv, r, with: find.replacement)
+        recomputeFind(tv, query: find.query, caseSensitive: find.caseSensitive)
+        let after = r.location + (find.replacement as NSString).length
+        findCurrent = findMatches.firstIndex(where: { $0.location >= after }) ?? 0
+        findCurrent = findMatches.isEmpty ? 0 : min(findCurrent, findMatches.count - 1)
+        highlightFind(tv)
+        if !findMatches.isEmpty { jumpToCurrentFind(tv) }
+        publishFind(find)
+    }
+
+    /// Replace every match in ONE undo step (reversed so earlier ranges stay valid).
+    private func replaceAllFind(_ tv: NSTextView, _ find: FindController) {
+        if findMatchesStale || findMatches.isEmpty {
+            recomputeFind(tv, query: find.query, caseSensitive: find.caseSensitive)
+        }
+        guard !findMatches.isEmpty else { publishFind(find); return }
+        tv.undoManager?.beginUndoGrouping()
+        for r in findMatches.reversed() { replaceRange(tv, r, with: find.replacement) }
+        tv.undoManager?.endUndoGrouping()
+        recomputeFind(tv, query: find.query, caseSensitive: find.caseSensitive)
+        findCurrent = 0
+        highlightFind(tv)
+        publishFind(find)
+    }
+
+    /// Edit through shouldChangeText/didChangeText so undo, syntax re-highlight, and the LSP
+    /// didChange all fire — bypassing LaTeXTextView.insertText's pair/auto-close handling.
+    private func replaceRange(_ tv: NSTextView, _ range: NSRange, with str: String) {
+        guard tv.shouldChangeText(in: range, replacementString: str) else { return }
+        tv.textStorage?.replaceCharacters(in: range, with: str)
+        tv.didChangeText()
+    }
+
+    /// Prefill the query from a non-empty single-line editor selection (deferred: the write can't
+    /// happen during the SwiftUI view update that drives this pass).
+    private func prefillFind(_ find: FindController, _ tv: NSTextView) {
+        let sel = tv.selectedRange()
+        guard sel.length > 0 else { return }
+        let s = (tv.string as NSString).substring(with: sel)
+        guard !s.contains("\n") else { return }
+        DispatchQueue.main.async { find.query = s }
+    }
+
+    /// Mirror match state onto the controller for the bar's counter (deferred + deduped to avoid
+    /// mutating observed state during the view update).
+    private func publishFind(_ find: FindController) {
+        let m = findMatches, c = findCurrent
+        guard find.matches != m || find.currentIndex != c else { return }
+        DispatchQueue.main.async {
+            if find.matches != m { find.matches = m }
+            if find.currentIndex != c { find.currentIndex = c }
+        }
     }
 }
 
@@ -854,6 +1335,8 @@ struct LaTeXEditorView: UIViewRepresentable {
     var selectReq: SelectLineRequest? = nil
     var scrollReq: SelectLineRequest? = nil
     var tabWidth: Int = 2                    // unused on iOS
+    var fontScale: Double = 1.0              // unused on iOS
+    var find: FindController? = nil          // unused on iOS
 
     func makeUIView(context: Context) -> UITextView {
         let tv = UITextView()

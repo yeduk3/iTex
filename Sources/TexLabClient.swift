@@ -7,6 +7,7 @@ import Observation
 final class TexLabClient {
     private(set) var latestCompletions: [(label: String, insertText: String)] = []
     private(set) var isReady = false
+    var onDiagnostics: (([Diagnostic]) -> Void)?
 
     private var process: Process?
     private var writer: FileHandle?
@@ -48,7 +49,7 @@ final class TexLabClient {
             "capabilities": [
                 "textDocument": [
                     "completion": [
-                        "completionItem": ["snippetSupport": false],
+                        "completionItem": ["snippetSupport": true],
                         "completionItemKind": ["valueSet": Array(1...25)],
                     ]
                 ]
@@ -133,8 +134,8 @@ final class TexLabClient {
     private func dispatch(_ data: Data) {
         guard let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
 
-        if msg["method"] != nil {
-            // Server-initiated notification (publishDiagnostics etc.) — ignore for now
+        if let method = msg["method"] as? String {
+            if method == "textDocument/publishDiagnostics" { handlePublishDiagnostics(msg["params"]) }
             return
         }
 
@@ -157,6 +158,23 @@ final class TexLabClient {
         }
     }
 
+    private func handlePublishDiagnostics(_ params: Any?) {
+        guard let p = params as? [String: Any],
+              let uri = p["uri"] as? String,
+              let items = p["diagnostics"] as? [[String: Any]] else { return }
+        let file = URL(string: uri)
+        let diags: [Diagnostic] = items.compactMap { item in
+            guard let message = item["message"] as? String,
+                  let range = item["range"] as? [String: Any],
+                  let start = range["start"] as? [String: Any],
+                  let line0 = start["line"] as? Int else { return nil }
+            let sev = item["severity"] as? Int ?? 3
+            let severity: DiagnosticSeverity = sev == 1 ? .error : sev == 2 ? .warning : .info
+            return Diagnostic(source: .lsp, severity: severity, file: file, line: line0 + 1, message: message)
+        }
+        onDiagnostics?(diags)
+    }
+
     private func parseCompletions(_ result: Any?) -> [(label: String, insertText: String)] {
         let arr: [[String: Any]]?
         if let list = result as? [String: Any] {
@@ -166,13 +184,10 @@ final class TexLabClient {
         }
         return arr?.compactMap { item in
             guard let label = item["label"] as? String else { return nil }
-            // texlab never sends insertText — it uses textEdit.newText (backslash-stripped for commands).
-            let raw = (item["insertText"] as? String)
+            // texlab uses textEdit.newText; keep any $-snippet placeholders for the accept path.
+            let insert = (item["insertText"] as? String)
                 ?? ((item["textEdit"] as? [String: Any])?["newText"] as? String)
                 ?? label
-            let insert = raw
-                .replacingOccurrences(of: "${0}", with: "")  // strip snippet placeholders
-                .replacingOccurrences(of: "\\$\\{\\d+\\}", with: "", options: .regularExpression)
             return (label: label, insertText: insert)
         } ?? []
     }
@@ -193,6 +208,7 @@ import Observation
 final class TexLabClient {
     private(set) var latestCompletions: [(label: String, insertText: String)] = []
     private(set) var isReady = false
+    var onDiagnostics: (([Diagnostic]) -> Void)?
     func start(workspaceURL: URL) {}
     func openDocument(url: URL, text: String) {}
     func changeDocument(text: String) {}

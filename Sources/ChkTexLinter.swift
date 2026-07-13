@@ -12,6 +12,7 @@ final class ChkTexLinter {
     }
 
     var warnings: [Warning] = []
+    var onResults: (([Warning]) -> Void)?
     private var task: Task<Void, Never>?
 
     func scheduleLint(fileURL: URL?) {
@@ -46,6 +47,7 @@ final class ChkTexLinter {
         }.value
 
         warnings = Self.parse(output: output)
+        onResults?(warnings)
 #endif
     }
 
