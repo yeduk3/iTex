@@ -455,8 +455,31 @@ final class LaTeXTextView: NSTextView {
         switch cmd {
         case .toggleComment: toggleComment(); return true
         case .showError:     toggleErrorPopoverAtCursor(); return true
+        case .focusSidebar:  toggleSidebarFocus(); return true
         default:             return false
         }
+    }
+
+    /// ⌘⇧E: move first-responder focus between the editor and the file sidebar's outline view.
+    /// performKeyEquivalent is dispatched window-wide (down the view tree, not the responder chain),
+    /// so this fires no matter which pane has focus. AppKit-level because SwiftUI @FocusState
+    /// cannot reliably *set* focus on a macOS 14 List.
+    /// ponytail: firstDescendant picks the first NSTableView in the window — the sidebar, since the
+    /// leading NavigationSplitView column precedes the problems panel in the view tree. If another
+    /// table ever wins, scope the search to the split view's leading pane.
+    private func toggleSidebarFocus() {
+        guard let win = window, let content = win.contentView,
+              let outline = Self.firstDescendant(of: content, where: { $0 is NSTableView })
+        else { return }
+        let fr = win.firstResponder as? NSView
+        let inSidebar = fr != nil && (fr === outline || fr!.isDescendant(of: outline))
+        win.makeFirstResponder(inSidebar ? self : outline)
+    }
+
+    static func firstDescendant(of root: NSView, where pred: (NSView) -> Bool) -> NSView? {
+        if pred(root) { return root }
+        for sub in root.subviews { if let f = firstDescendant(of: sub, where: pred) { return f } }
+        return nil
     }
 
     // Tab: indent selection / wrap `\env` in begin-end / insert 2 spaces
@@ -488,6 +511,26 @@ final class LaTeXTextView: NSTextView {
         let hasNL = lineFull.hasSuffix("\n")
         let line = hasNL ? String(lineFull.dropLast()) : lineFull
         let indent = leadingWhitespace(of: line)
+
+        // Comment line + Enter → continue the same `%` run (mirrors `\item`). Checked before the
+        // list branch so a comment inside a list env continues the comment, not the `\item`.
+        let rest = line.dropFirst(indent.count)
+        if rest.first == "%" {
+            let marker = String(rest.prefix { $0 == "%" })
+            // Only continue when the caret sits after the marker; Enter before/at it stays a plain
+            // newline+indent (the comment text moves down unmodified).
+            if loc - lineRange.location >= indent.count + marker.count {
+                let body = rest.dropFirst(marker.count).trimmingCharacters(in: .whitespaces)
+                if body.isEmpty {   // empty comment + Enter → drop the marker, exit the comment
+                    replace(range: lineRange, with: indent + (hasNL ? "\n" : ""),
+                            newSelection: NSRange(location: lineRange.location + (indent as NSString).length, length: 0))
+                    return
+                }
+                super.insertNewline(sender)
+                insertText(indent + marker + " ", replacementRange: selectedRange())
+                return
+            }
+        }
 
         if inListEnvironment(at: loc) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -598,6 +641,60 @@ final class LaTeXTextView: NSTextView {
         return super.resignFirstResponder()
     }
 
+    // MARK: - Image paste (saves the image beside the .tex and inserts \includegraphics)
+
+    /// Paste with an image on the pasteboard saves it into the document's folder (preferring an
+    /// existing figures/ images/ fig/ subfolder) and inserts an \includegraphics for it.
+    /// Plain text paste is untouched. Marked text (IME composition) always defers to super.
+    override func paste(_ sender: Any?) {
+        guard !hasMarkedText(), let baseDir = (delegate as? Coordinator)?.compiler?.fileURL?.deletingLastPathComponent(),
+              let saved = Self.saveImageFromPasteboard(NSPasteboard.general, near: baseDir)
+        else { super.paste(sender); return }
+
+        // Path relative to the .tex dir, extension dropped (LaTeX resolves it).
+        let rel = saved.path.hasPrefix(baseDir.path + "/")
+            ? String(saved.path.dropFirst(baseDir.path.count + 1))
+            : saved.lastPathComponent
+        let relNoExt = (rel as NSString).deletingPathExtension
+        let snippet = "\\includegraphics[width=0.8\\linewidth]{\(relNoExt)}"
+        replace(range: selectedRange(), with: snippet,
+                newSelection: NSRange(location: selectedRange().location + (snippet as NSString).length, length: 0))
+    }
+
+    /// Image file URL (Finder copy) or raw bitmap (screenshot) → saved file URL, else nil.
+    /// Destination: an existing figures/ images/ fig/ subfolder of `baseDir`, else `baseDir` itself.
+    private static func saveImageFromPasteboard(_ pb: NSPasteboard, near baseDir: URL) -> URL? {
+        let dir = ["figures", "images", "fig"].map { baseDir.appending(path: $0) }
+            .first { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true } ?? baseDir
+
+        // 1. An image file copied from Finder → copy it across, keeping name/extension.
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           let src = urls.first(where: { imagePasteExts.contains($0.pathExtension.lowercased()) }) {
+            let dest = uniqueImageURL(in: dir, base: src.deletingPathExtension().lastPathComponent, ext: src.pathExtension)
+            return (try? FileManager.default.copyItem(at: src, to: dest)) != nil ? dest : nil
+        }
+        // 2. A raw bitmap (screenshot, browser image) → encode PNG. Text-only pasteboards (string
+        //    present, no image data) fall through to nil so normal text paste is untouched.
+        guard pb.string(forType: .string) == nil || pb.availableType(from: [.tiff, .png]) != nil,
+              let img = NSImage(pasteboard: pb),
+              let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:])
+        else { return nil }
+        let dest = uniqueImageURL(in: dir, base: "image", ext: "png")
+        return (try? png.write(to: dest)) != nil ? dest : nil
+    }
+
+    private static let imagePasteExts: Set<String> = ["png", "jpg", "jpeg", "pdf", "gif", "tiff", "tif", "bmp", "heic"]
+
+    /// First free `base.ext` (then `base-1.ext`, …) in `dir`.
+    private static func uniqueImageURL(in dir: URL, base: String, ext: String) -> URL {
+        func make(_ n: Int) -> URL { dir.appending(path: n == 0 ? "\(base).\(ext)" : "\(base)-\(n).\(ext)") }
+        var n = 0
+        while FileManager.default.fileExists(atPath: make(n).path) { n += 1 }
+        return make(n)
+    }
+
     // MARK: helpers
 
     private func isAsciiLetter(_ c: unichar) -> Bool {
@@ -675,6 +772,17 @@ final class LaTeXTextView: NSTextView {
         var lines = block.components(separatedBy: "\n")
         if trailingNL { lines.removeLast() }
         let content = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        // All-empty selection: the normal path skips whitespace-only lines (silent no-op). Instead
+        // append `% ` so the user can start typing; single line → caret right after the marker.
+        if content.isEmpty {
+            let newLines = lines.map { $0 + "% " }
+            let newBlock = newLines.joined(separator: "\n") + (trailingNL ? "\n" : "")
+            let selection = lines.count == 1
+                ? NSRange(location: lineRange.location + ((lines[0] + "% ") as NSString).length, length: 0)
+                : NSRange(location: lineRange.location, length: (newBlock as NSString).length)
+            replace(range: lineRange, with: newBlock, newSelection: selection)
+            return
+        }
         let allCommented = !content.isEmpty && content.allSatisfy {
             $0.drop { $0 == " " || $0 == "\t" }.first == "%"
         }
@@ -847,15 +955,28 @@ final class LaTeXTextView: NSTextView {
 
     // MARK: - Scroll sync
 
-    /// 1-based source line at the vertical center of the visible editor area.
-    func lineAtVisibleCenter() -> Int? {
+    /// 1-based source line at the vertical center of the visible editor area, plus where within
+    /// that (possibly soft-wrapped) line the center sits (0 = its first visual row, 1 = its last).
+    /// The fraction picks the matching typeset row among SyncTeX's per-row records, so a long
+    /// paragraph written as one source line still centers PDF-row ↔ editor-row, not paragraph start.
+    func lineAtVisibleCenter() -> (line: Int, fraction: CGFloat)? {
         guard let lm = layoutManager, let tc = textContainer, let scroll = enclosingScrollView else { return nil }
         let o = textContainerOrigin
-        let glyph = lm.glyphIndex(for: NSPoint(x: 4 - o.x, y: scroll.documentVisibleRect.midY - o.y), in: tc)
+        let centerY = scroll.documentVisibleRect.midY
+        let glyph = lm.glyphIndex(for: NSPoint(x: 4 - o.x, y: centerY - o.y), in: tc)
         let char = lm.characterIndexForGlyph(at: glyph)
         let ns = string as NSString
         guard char <= ns.length else { return nil }
-        return ns.substring(to: char).components(separatedBy: "\n").count
+        let line = ns.substring(to: char).components(separatedBy: "\n").count
+
+        var fraction: CGFloat = 0.5
+        if let cr = LaTeXEditorView.range(ofLine: line, in: string) {
+            let gr = lm.glyphRange(forCharacterRange: cr, actualCharacterRange: nil)
+            var r = lm.boundingRect(forGlyphRange: gr, in: tc)
+            r.origin.y += o.y
+            if r.height > 1 { fraction = min(max((centerY - r.minY) / r.height, 0), 1) }
+        }
+        return (line, fraction)
     }
 
     /// Smoothly scroll so a 1-based line sits at the vertical center, clamped to the document.
@@ -1118,8 +1239,8 @@ final class Coordinator: NSObject, NSTextViewDelegate {
         guard compiler?.scrollSyncEnabled == true, compiler?.inSyncCooldown == false else { return }
         scrollWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self, let line = self.textView?.lineAtVisibleCenter() else { return }
-            Task { @MainActor in await self.compiler?.forwardSearch(line: line) }
+            guard let self, let hit = self.textView?.lineAtVisibleCenter() else { return }
+            Task { @MainActor in await self.compiler?.forwardSearch(line: hit.line, fraction: hit.fraction) }
         }
         scrollWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)

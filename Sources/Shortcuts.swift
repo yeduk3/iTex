@@ -56,7 +56,7 @@ struct KeyCombo: Codable, Equatable {
 
 /// Every command whose shortcut the user can reassign (toolbar buttons + editor features).
 enum AppCommand: String, CaseIterable, Identifiable {
-    case build, cleanBuild, forwardSync, scrollSyncToggle, toggleComment, showError, toggleSidebar
+    case build, cleanBuild, forwardSync, scrollSyncToggle, toggleComment, showError, toggleSidebar, focusSidebar
 
     var id: String { rawValue }
 
@@ -69,6 +69,7 @@ enum AppCommand: String, CaseIterable, Identifiable {
         case .toggleComment:    return "Toggle line comment"
         case .showError:        return "Show error message"
         case .toggleSidebar:    return "Toggle file sidebar"
+        case .focusSidebar:     return "Focus file sidebar"
         }
     }
 
@@ -81,6 +82,7 @@ enum AppCommand: String, CaseIterable, Identifiable {
         case .toggleComment:    return KeyCombo(key: "/")
         case .showError:        return KeyCombo(key: ".")
         case .toggleSidebar:    return KeyCombo(key: "\\")
+        case .focusSidebar:     return KeyCombo(key: "e", command: true, shift: true)
         }
     }
 }

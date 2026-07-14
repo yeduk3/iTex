@@ -98,7 +98,10 @@ struct ContentView: View {
         }
         .background(WindowAccessor(rootKey: fileURL?.deletingLastPathComponent().standardizedFileURL.path ?? "none"))
         .onAppear { columnVisibility = showSidebar ? .all : .doubleColumn }
-        .onChange(of: columnVisibility) { _, v in showSidebar = (v != .detailOnly) }
+        .onChange(of: columnVisibility) { _, v in
+            showSidebar = (v != .detailOnly)
+            if v == .detailOnly { SidebarPreviewPanel.shared.hide() }   // sidebar gone → its child panel would orphan
+        }
         .sheet(isPresented: Binding(get: { quickOpen.isVisible },
                                     set: { if !$0 { quickOpen.hide() } })) {
             QuickOpenPalette(controller: quickOpen, onOpen: handleQuickOpen)
@@ -434,7 +437,7 @@ struct SidebarView: View {
     let currentFile: URL?
     @StateObject private var tree = FileTreeModel()
     @State private var selection: URL?
-    @State private var preview: FileEntry?
+    @State private var previewOn = false
 
     var body: some View {
         Group {
@@ -453,6 +456,23 @@ struct SidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .contextMenu(forSelectionType: URL.self) { urls in
+                    if let url = urls.first { contextMenuItems(for: url) }
+                } primaryAction: { urls in
+                    if let url = urls.first { activate(url) }
+                }
+                .onKeyPress(.return) {
+                    guard let sel = selection else { return .ignored }
+                    activate(sel); return .handled
+                }
+                .onKeyPress(.space) { previewOn.toggle(); refreshPreview(); return .handled }
+                .onDeleteCommand {   // standard macOS delete hook; onKeyPress never receives ⌘-combos
+                    guard let sel = selection else { return }
+                    SidebarPreviewPanel.shared.hide()   // panel may be showing the file being deleted
+                    SidebarFileOps.delete(sel)
+                }
+                .onChange(of: selection) { _, _ in refreshPreview() }
+                .onDisappear { SidebarPreviewPanel.shared.hide() }
             } else {
                 ContentUnavailableView("No Folder", systemImage: "folder",
                     description: Text("Open a .tex file to browse its folder."))
@@ -461,26 +481,48 @@ struct SidebarView: View {
         .onAppear { tree.watch(root); selection = currentFile }
         .onChange(of: root) { _, new in tree.watch(new) }
         .onChange(of: currentFile) { _, f in selection = f }
-        // Single click selects; an image selection previews it, a supported document opens it as a
-        // tab (reliable where a row TapGesture gets swallowed by the table's own mouse tracking).
-        .onChange(of: selection) { _, url in
-            guard let url else { return }
-            let ext = url.pathExtension.lowercased()
-            if FileEntry.imageExts.contains(ext) {
-                preview = FileEntry(url: url, name: url.lastPathComponent, isDirectory: false)
-            } else if FileEntry.openableExts.contains(ext),
-                      url.standardizedFileURL != currentFile?.standardizedFileURL {
-                NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
-            }
+    }
+
+    /// Double-click / Return: the only paths that open anything. Folders toggle disclosure,
+    /// previewables open the preview panel, documents open as a tab. Arrow-key selection alone
+    /// never opens or previews — that conflation was the source of the sidebar's focus bugs.
+    private func activate(_ url: URL) {
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+        let ext = url.pathExtension.lowercased()
+        if isDir.boolValue {
+            if SidebarExpansion.shared.expanded.contains(url) { SidebarExpansion.shared.expanded.remove(url) }
+            else { SidebarExpansion.shared.expanded.insert(url) }
+        } else if FileEntry.imageExts.contains(ext) {
+            previewOn = true
+            refreshPreview()
+        } else if FileEntry.openableExts.contains(ext),
+                  url.standardizedFileURL != currentFile?.standardizedFileURL {
+            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
         }
-        .popover(item: $preview) { entry in
-            if let img = NSImage(contentsOf: entry.url) {
-                Image(nsImage: img).resizable().scaledToFit()
-                    .frame(maxWidth: 360, maxHeight: 360).padding(8)
-            } else {
-                Text("Cannot preview \(entry.name)").padding()
-            }
+    }
+
+    /// Preview panel follows the selection while toggled on; hides on non-previewable rows
+    /// (toggle state survives, Quick Look-style).
+    private func refreshPreview() {
+        guard previewOn, let url = selection,
+              FileEntry.imageExts.contains(url.pathExtension.lowercased()) else {
+            SidebarPreviewPanel.shared.hide(); return
         }
+        SidebarPreviewPanel.shared.show(url: url, in: NSApp.keyWindow)
+    }
+
+    @ViewBuilder private func contextMenuItems(for url: URL) -> some View {
+        let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+        if isDir {
+            Button("New File…") { SidebarFileOps.newFile(in: url) }
+            Button("New Folder…") { SidebarFileOps.newFolder(in: url) }
+            Divider()
+        }
+        Button("Rename…") { SidebarFileOps.promptRename(url) }
+        Button("Delete") { SidebarFileOps.delete(url) }
+        Divider()
+        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
     }
 }
 
@@ -520,7 +562,6 @@ private struct FileRow: View {
             .onAppear { reloadChildrenIfExpanded() }
             .onChange(of: expansion.expanded) { _, _ in reloadChildrenIfExpanded() }
             .onChange(of: tree.version) { _, _ in reloadChildrenIfExpanded() }
-            .contextMenu { menuItems }
         } else {
             Label {
                 Text(entry.name).lineLimit(1)
@@ -531,20 +572,7 @@ private struct FileRow: View {
             .fontWeight(isCurrent ? .semibold : .regular)
             .tag(entry.url)
             .onDrag { NSItemProvider(object: entry.url as NSURL) }
-            .contextMenu { menuItems }
         }
-    }
-
-    @ViewBuilder private var menuItems: some View {
-        if entry.isDirectory {
-            Button("New File…") { SidebarFileOps.newFile(in: entry.url) }
-            Button("New Folder…") { SidebarFileOps.newFolder(in: entry.url) }
-            Divider()
-        }
-        Button("Rename…") { SidebarFileOps.promptRename(entry.url) }
-        Button("Delete") { SidebarFileOps.delete(entry.url) }
-        Divider()
-        Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([entry.url]) }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -670,6 +698,73 @@ private enum SidebarFileOps {
             if let error { alert.informativeText = error.localizedDescription }
             alert.runModal()
         }
+    }
+}
+
+// MARK: - Sidebar image/PDF preview panel
+
+/// Quick Look-style preview for the sidebar's selected image/PDF, toggled with Space.
+/// A non-activating child panel (never key — the List keeps keyboard focus, unlike an
+/// NSPopover/.popover which steals it) anchored beside the selected row.
+/// ponytail: anchored at show-time row rect — scrolling the list doesn't move it; it re-anchors
+/// on the next selection change. Track scroll notifications if that ever matters.
+@MainActor
+final class SidebarPreviewPanel {
+    static let shared = SidebarPreviewPanel()
+    private var panel: NSPanel?
+
+    func show(url: URL, in window: NSWindow?) {
+        guard let window, let img = NSImage(contentsOf: url),
+              let table = (window.firstResponder as? NSTableView)
+                ?? firstTable(in: window.contentView), table.selectedRow >= 0
+        else { hide(); return }
+
+        // Selected row's frame in screen coords; panel sits to its right.
+        let rowInWindow = table.convert(table.rect(ofRow: table.selectedRow), to: nil)
+        let rowOnScreen = window.convertToScreen(rowInWindow)
+
+        let maxDim: CGFloat = 360
+        let scale = min(1, maxDim / max(img.size.width, img.size.height, 1))
+        let size = NSSize(width: max(img.size.width * scale, 40), height: max(img.size.height * scale, 40))
+
+        let p = panel ?? makePanel()
+        (p.contentView as? NSImageView)?.image = img
+        var origin = NSPoint(x: rowOnScreen.maxX + 8, y: rowOnScreen.midY - size.height / 2)
+        if let vf = window.screen?.visibleFrame {
+            origin.y = min(max(origin.y, vf.minY), vf.maxY - size.height)
+            origin.x = min(origin.x, vf.maxX - size.width)
+        }
+        p.setFrame(NSRect(origin: origin, size: size), display: true)
+        if p.parent == nil { window.addChildWindow(p, ordered: .above) }
+        p.orderFront(nil)
+    }
+
+    func hide() {
+        guard let p = panel, p.isVisible else { return }
+        p.parent?.removeChildWindow(p)
+        p.orderOut(nil)
+    }
+
+    private func makePanel() -> NSPanel {
+        let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: true)
+        p.level = .floating
+        p.hasShadow = true
+        p.isOpaque = false
+        p.backgroundColor = .windowBackgroundColor
+        p.isExcludedFromWindowsMenu = true
+        let iv = NSImageView()
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        p.contentView = iv
+        panel = p
+        return p
+    }
+
+    private func firstTable(in root: NSView?) -> NSTableView? {
+        guard let root else { return nil }
+        if let t = root as? NSTableView { return t }
+        for sub in root.subviews { if let t = firstTable(in: sub) { return t } }
+        return nil
     }
 }
 #endif

@@ -267,15 +267,25 @@ final class LaTeXCompiler {
 
 #if os(macOS)
     /// Forward search: locate the PDF region for an editor line (defaults to the cursor line).
-    func forwardSearch(line: Int? = nil) async {
+    /// A soft-wrapped source line (long paragraph) yields one SyncTeX record per typeset row —
+    /// `fraction` (0 = first row, 1 = last) picks the row matching the editor viewport center,
+    /// so the PDF centers on the row actually on screen, not the paragraph start.
+    func forwardSearch(line: Int? = nil, fraction: CGFloat = 0.5) async {
         guard let pdfURL, let texFile = compiledTexURL ?? fileURL else { return }
         let heights = PDFPageHeights(url: pdfURL)
         let results = await SyncTeXService.forward(
             line: line ?? cursorLine, texFile: texFile, pdf: pdfURL,
             pageHeight: { heights.height(page: $0) })
-        guard let page = results.first?.page else { return }
+        guard !results.isEmpty else { return }
+        // Records arrive unsorted and may span pages: order top-to-bottom (page, then y-down),
+        // pick by fraction, and highlight that row's page.
+        let ordered = results.sorted {
+            ($0.page, -$0.rect.midY) < ($1.page, -$1.rect.midY)   // PDF y-up → -midY sorts top-first
+        }
+        let idx = Int((fraction * CGFloat(ordered.count - 1)).rounded())
+        let chosen = ordered[min(max(idx, 0), ordered.count - 1)]
         syncToken += 1
-        forwardHighlight = ForwardHighlight(page: page, rects: results.filter { $0.page == page }.map(\.rect), token: syncToken)
+        forwardHighlight = ForwardHighlight(page: chosen.page, rects: [chosen.rect], token: syncToken)
     }
 
     /// Scroll-sync: a PDF viewport-center point → the matching source line, to center in the editor.
