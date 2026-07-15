@@ -19,8 +19,14 @@ struct PDFPreviewView: View {
             if let url = compiler.pdfURL {
                 // Pass the forward-search request so SwiftUI re-runs updateNSView when it changes.
                 PDFKitRepresentable(url: url, compiler: compiler, forward: compiler.forwardHighlight)
-            } else if compiler.isCompiling {
-                ProgressView("Compiling…")
+            } else if compiler.previewState == .buildingDraft || compiler.isFinalBuilding {
+                ProgressView(compiler.isFinalBuilding ? "Final build…" : "Building draft…")
+            } else if compiler.previewState == .failed {
+                ContentUnavailableView(
+                    "Preview Failed",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(compiler.errorMessage ?? "LaTeX could not generate a preview")
+                )
             } else {
                 ContentUnavailableView(
                     "No Preview",
@@ -75,11 +81,15 @@ private struct PDFKitRepresentable: NSViewRepresentable {
                 let i = view.document?.index(for: p) ?? NSNotFound
                 return i == NSNotFound ? nil : i
             }
+            let oldBounds = dest?.page?.bounds(for: .mediaBox)
             view.document = PDFDocument(url: url)
-            view.scaleFactor = scale
-            if let dest, let pageIndex, let page = view.document?.page(at: pageIndex) {
+            view.scaleFactor = min(max(scale, view.minScaleFactor), view.maxScaleFactor)
+            if let dest, let pageIndex, let document = view.document, document.pageCount > 0,
+               let page = document.page(at: min(max(pageIndex, 0), document.pageCount - 1)) {
                 compiler.beginSyncCooldown()   // restored scroll must not echo to the editor via scroll-sync
-                view.go(to: PDFDestination(page: page, at: dest.point))
+                let newBounds = page.bounds(for: .mediaBox)
+                let point = Self.restoredPoint(dest.point, oldBounds: oldBounds, newBounds: newBounds)
+                view.go(to: PDFDestination(page: page, at: point))
             }
         }
 
@@ -180,6 +190,18 @@ private struct PDFKitRepresentable: NSViewRepresentable {
             Task { @MainActor in await compiler.syncPDFToEditor(page: pageIndex + 1, point: local, pageHeight: height) }
         }
     }
+
+    /// Preserve the in-page position proportionally when media-box dimensions change, then clamp.
+    private static func restoredPoint(_ point: CGPoint, oldBounds: CGRect?, newBounds: CGRect) -> CGPoint {
+        guard let old = oldBounds, old.width > 0, old.height > 0 else {
+            return CGPoint(x: min(max(point.x, newBounds.minX), newBounds.maxX),
+                           y: min(max(point.y, newBounds.minY), newBounds.maxY))
+        }
+        let x = newBounds.minX + ((point.x - old.minX) / old.width) * newBounds.width
+        let y = newBounds.minY + ((point.y - old.minY) / old.height) * newBounds.height
+        return CGPoint(x: min(max(x, newBounds.minX), newBounds.maxX),
+                       y: min(max(y, newBounds.minY), newBounds.maxY))
+    }
 }
 
 // MARK: - iOS (no inverse search; viewport preserved)
@@ -212,10 +234,25 @@ private struct PDFKitRepresentable: UIViewRepresentable {
                 let i = view.document?.index(for: p) ?? NSNotFound
                 return i == NSNotFound ? nil : i
             }
+            let oldBounds = dest?.page?.bounds(for: .mediaBox)
             view.document = PDFDocument(url: url)
-            view.scaleFactor = scale
-            if let dest, let pageIndex, let page = view.document?.page(at: pageIndex) {
-                view.go(to: PDFDestination(page: page, at: dest.point))
+            view.scaleFactor = min(max(scale, view.minScaleFactor), view.maxScaleFactor)
+            if let dest, let pageIndex, let document = view.document, document.pageCount > 0,
+               let page = document.page(at: min(max(pageIndex, 0), document.pageCount - 1)) {
+                let newBounds = page.bounds(for: .mediaBox)
+                let point: CGPoint
+                if let old = oldBounds, old.width > 0, old.height > 0 {
+                    point = CGPoint(
+                        x: min(max(newBounds.minX + ((dest.point.x - old.minX) / old.width) * newBounds.width,
+                                   newBounds.minX), newBounds.maxX),
+                        y: min(max(newBounds.minY + ((dest.point.y - old.minY) / old.height) * newBounds.height,
+                                   newBounds.minY), newBounds.maxY)
+                    )
+                } else {
+                    point = CGPoint(x: min(max(dest.point.x, newBounds.minX), newBounds.maxX),
+                                    y: min(max(dest.point.y, newBounds.minY), newBounds.maxY))
+                }
+                view.go(to: PDFDestination(page: page, at: point))
             }
         }
     }

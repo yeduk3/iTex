@@ -36,17 +36,19 @@ func runWarmBench(_ args: [String]) async {
 
     // COLD: arm then feed immediately — the fed filename waits in the pipe, so the timed feed
     // includes the whole preamble (CJK fonts, theme) + body = a full single-pass compile.
-    await warm.arm(buildTex: buildTex, engine: engine, preambleHash: hash, workingDir: dir, resources: resources)
+    await warm.arm(buildTex: buildTex, engine: engine, preambleHash: hash,
+                   cwd: dir, outDir: dir, resources: resources)
     var t = Date()
-    let cold = await warm.tryCompile(buildTex: buildTex, engine: engine, preambleHash: hash, workingDir: dir)
+    let cold = await warm.tryCompile(buildTex: buildTex, engine: engine, preambleHash: hash, outDir: dir)
     let coldT = took(t)
     print("COLD (preamble+body): \(coldT)   pdf=\(cold != nil)  synctex=\(cold?.synctexURL != nil)")
 
     // WARM: arm, let the preamble load off the clock, then feed → only the body is typeset.
-    await warm.arm(buildTex: buildTex, engine: engine, preambleHash: hash, workingDir: dir, resources: resources)
+    await warm.arm(buildTex: buildTex, engine: engine, preambleHash: hash,
+                   cwd: dir, outDir: dir, resources: resources)
     try? await Task.sleep(for: .seconds(6))
     t = Date()
-    let warmR = await warm.tryCompile(buildTex: buildTex, engine: engine, preambleHash: hash, workingDir: dir)
+    let warmR = await warm.tryCompile(buildTex: buildTex, engine: engine, preambleHash: hash, outDir: dir)
     let warmT = took(t)
     print("WARM (body only):     \(warmT)   pdf=\(warmR != nil)  synctex=\(warmR?.synctexURL != nil)")
     await warm.kill()

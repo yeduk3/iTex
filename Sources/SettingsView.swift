@@ -7,6 +7,7 @@ struct ShortcutSettingsView: View {
     @State private var store = ShortcutStore.shared
     @AppStorage("previewSplitVertical") private var verticalSplit = false
     @AppStorage("editorTabWidth") private var tabWidth = 2
+    @AppStorage(ExternalTerminalLauncher.preferenceKey) private var terminalPreference = ExternalTerminalPreference.automatic.rawValue
 
     var body: some View {
         Form {
@@ -21,6 +22,25 @@ struct ShortcutSettingsView: View {
                 }
             } header: {
                 Text("Layout")
+            }
+
+            Section {
+                Picker("Terminal application", selection: $terminalPreference) {
+                    ForEach(ExternalTerminalPreference.allCases) { terminal in
+                        let installed = ExternalTerminalLauncher.isInstalled(terminal)
+                        Text(terminal.displayName + (installed ? "" : " — Not installed"))
+                            .tag(terminal.rawValue)
+                            .disabled(!installed)
+                    }
+                }
+
+                terminalResolution
+                    .font(.caption)
+            } header: {
+                Text("Terminal")
+            } footer: {
+                Text("Automatic prefers Ghostty and falls back to the system Terminal.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -43,7 +63,24 @@ struct ShortcutSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 340)
+        .frame(width: 480, height: 440)
+    }
+
+    @ViewBuilder
+    private var terminalResolution: some View {
+        let selected = ExternalTerminalPreference(rawValue: terminalPreference) ?? .automatic
+        if let resolved = ExternalTerminalLauncher.resolvedApplication(for: selected) {
+            if selected == .automatic {
+                Text("Currently resolves to \(resolved.preference.displayName).")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(resolved.preference.displayName) is installed and ready.")
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Text("\(selected.displayName) is not installed. Choose an available terminal.")
+                .foregroundStyle(.red)
+        }
     }
 }
 

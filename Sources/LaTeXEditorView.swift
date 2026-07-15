@@ -275,6 +275,9 @@ final class LaTeXTextView: NSTextView {
     // MARK: - VSCode-like editing
 
     private let indentUnit = "\t"   // Tab / auto-indent → real tab
+    /// Number of spaces represented by one indentation level. Tab insertion remains a real tab;
+    /// this width is used when existing space-indented text is dedented or backspaced.
+    var indentationWidth = 2
 
     // Environments wrappable via `\env` + Tab (after picking the command from completion).
     private static let listEnvironments: Set<String> = ["itemize", "enumerate", "description"]
@@ -283,6 +286,15 @@ final class LaTeXTextView: NSTextView {
     // Editor shortcuts run through ShortcutStore (user-reassignable in Settings). performKeyEquivalent
     // catches command combos first — needed for ⌘. which macOS turns into Cancel before keyDown.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Intercept Cmd+Backspace before AppKit/menu key equivalents can route it around the text
+        // command selectors. Shift does not change this operation; Option/Control retain stock word
+        // deletion and other bindings.
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if !hasMarkedText(), event.keyCode == 51,
+           flags.contains(.command), !flags.contains(.option), !flags.contains(.control) {
+            performIndentPreservingCommandDelete()
+            return true
+        }
         if !hasMarkedText(), let cmd = ShortcutStore.shared.command(for: event), runEditorCommand(cmd) {
             return true
         }
@@ -605,7 +617,7 @@ final class LaTeXTextView: NSTextView {
             let col = sel.location - lineStart
             let before = ns.substring(with: NSRange(location: lineStart, length: col))
             if col > 0, before.allSatisfy({ $0 == " " }) {
-                let unit = indentUnit.count
+                let unit = max(1, indentationWidth)
                 let remove = col - ((col - 1) / unit) * unit   // back to prev multiple of unit (≥1)
                 replace(range: NSRange(location: sel.location - remove, length: remove), with: "",
                         newSelection: NSRange(location: sel.location - remove, length: 0))
@@ -614,6 +626,76 @@ final class LaTeXTextView: NSTextView {
         }
         if !handled { super.deleteBackward(sender) }
         if completion.isVisible { updateCompletionAfterEdit() }
+    }
+
+    // Cmd+Delete is normally deleteToBeginningOfLine, but some AppKit key-binding setups emit
+    // deleteToBeginningOfParagraph. Handle both without affecting Option+Delete/deleteWordBackward.
+    override func deleteToBeginningOfLine(_ sender: Any?) {
+        if !deleteToIndentBoundary(useVisualLineStart: true) { super.deleteToBeginningOfLine(sender) }
+    }
+
+    override func deleteToBeginningOfParagraph(_ sender: Any?) {
+        if !deleteToIndentBoundary(useVisualLineStart: false) { super.deleteToBeginningOfParagraph(sender) }
+    }
+
+    /// Key-equivalent entry point for Cmd+Backspace. A selection keeps normal deletion semantics;
+    /// a caret uses the indentation-preserving visual-line operation.
+    private func performIndentPreservingCommandDelete() {
+        let sel = selectedRange()
+        guard sel.length > 0 else {
+            _ = deleteToIndentBoundary(useVisualLineStart: true)
+            return
+        }
+
+        let wasApplying = isApplyingEdit; isApplyingEdit = true
+        defer { isApplyingEdit = wasApplying }
+        _ = replace(range: sel, with: "", newSelection: NSRange(location: sel.location, length: 0))
+        if completion.isVisible { updateCompletionAfterEdit() }
+    }
+
+    /// Delete line content before a caret while retaining all leading tabs/spaces. Returns false
+    /// for selections and IME composition so AppKit preserves their standard behavior.
+    private func deleteToIndentBoundary(useVisualLineStart: Bool) -> Bool {
+        guard !hasMarkedText() else { return false }
+        let sel = selectedRange()
+        guard sel.length == 0 else { return false }
+
+        let ns = string as NSString
+        let caret = min(sel.location, ns.length)
+        let lineStart = ns.lineRange(for: NSRange(location: caret, length: 0)).location
+        let relevantStart = useVisualLineStart ? visualLineStart(at: caret) : lineStart
+        var indentEnd = lineStart
+        while indentEnd < ns.length {
+            let c = ns.character(at: indentEnd)
+            guard c == 0x20 || c == 0x09 else { break } // space / tab
+            indentEnd += 1
+        }
+        // On or inside indentation (including a whitespace-only line), Cmd+Delete is a no-op.
+        let deleteStart = max(relevantStart, indentEnd)
+        guard caret > deleteStart else { return true }
+
+        let wasApplying = isApplyingEdit; isApplyingEdit = true
+        defer { isApplyingEdit = wasApplying }
+        _ = replace(range: NSRange(location: deleteStart, length: caret - deleteStart), with: "",
+                    newSelection: NSRange(location: deleteStart, length: 0))
+        if completion.isVisible { updateCompletionAfterEdit() }
+        return true
+    }
+
+    /// Character start of the current laid-out line fragment. This preserves stock Cmd+Delete
+    /// behavior on soft-wrapped lines while still protecting the hard line's leading indentation.
+    private func visualLineStart(at caret: Int) -> Int {
+        guard let lm = layoutManager else { return caret }
+        let nsLength = (string as NSString).length
+        if caret == nsLength, (nsLength == 0 || (nsLength > 0 && (string as NSString).character(at: nsLength - 1) == 0x0A)) {
+            return caret
+        }
+        let character = min(caret, max(0, nsLength - 1))
+        let glyph = lm.glyphRange(forCharacterRange: NSRange(location: character, length: 0),
+                                  actualCharacterRange: nil).location
+        var fragmentGlyphRange = NSRange()
+        _ = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &fragmentGlyphRange)
+        return lm.characterIndexForGlyph(at: fragmentGlyphRange.location)
     }
 
     // Every committed edit re-flows active snippet stops. Skip while composing (marked text): the
@@ -807,12 +889,47 @@ final class LaTeXTextView: NSTextView {
     }
 
     private func dedentSelection() {
-        rewriteSelectedLines { line in
-            var l = Substring(line), removed = 0
-            while removed < self.indentUnit.count, l.first == " " { l.removeFirst(); removed += 1 }
-            if removed == 0, l.first == "\t" { l.removeFirst() }
-            return String(l)
+        let ns = string as NSString
+        let originalSelection = selectedRange()
+        let lineRange = ns.lineRange(for: originalSelection)
+        let block = ns.substring(with: lineRange)
+        let trailingNL = block.hasSuffix("\n")
+        var lines = block.components(separatedBy: "\n")
+        if trailingNL { lines.removeLast() }
+
+        var removedPerLine: [Int] = []
+        let newLines = lines.map { line -> String in
+            let source = line as NSString
+            let remove = self.dedentPrefixLength(in: source)
+            removedPerLine.append(remove)
+            return source.substring(from: remove)
         }
+        let newBlock = newLines.joined(separator: "\n") + (trailingNL ? "\n" : "")
+
+        let newSelection: NSRange
+        if originalSelection.length == 0 {
+            // Keep the caret attached to the same content; if it was inside removed whitespace,
+            // clamp it to the new line start instead of selecting the rewritten line.
+            let removed = removedPerLine.first ?? 0
+            let column = originalSelection.location - lineRange.location
+            newSelection = NSRange(location: lineRange.location + max(0, column - removed), length: 0)
+        } else {
+            // Indentation is a line operation: keep all affected rewritten lines selected.
+            newSelection = NSRange(location: lineRange.location, length: (newBlock as NSString).length)
+        }
+        replace(range: lineRange, with: newBlock, newSelection: newSelection)
+    }
+
+    /// One indentation level is one leading tab, otherwise up to the configured number of
+    /// leading spaces. A spaces-then-tab prefix removes only the spaces on this invocation.
+    private func dedentPrefixLength(in line: NSString) -> Int {
+        guard line.length > 0 else { return 0 }
+        if line.character(at: 0) == 0x09 { return 1 }
+        var count = 0
+        while count < min(max(1, indentationWidth), line.length), line.character(at: count) == 0x20 {
+            count += 1
+        }
+        return count
     }
 
     private func rewriteSelectedLines(_ transform: (String) -> String) {
@@ -1086,6 +1203,7 @@ struct LaTeXEditorView: NSViewRepresentable {
         tv.usesRuler       = true
         let editorFont     = LaTeXEditorView.editorFont(scale: fontScale)
         tv.font            = editorFont
+        tv.indentationWidth = max(1, tabWidth)
         // Render a tab at `tabWidth` space-widths instead of the wide default tab stop.
         let tabStyle = tabParagraphStyle(font: editorFont)
         tv.defaultParagraphStyle = tabStyle
@@ -1129,6 +1247,7 @@ struct LaTeXEditorView: NSViewRepresentable {
         guard let tv = scrollView.documentView as? LaTeXTextView else { return }
         context.coordinator.texLabClient = texLabClient   // keep in sync
         context.coordinator.compiler = compiler
+        tv.indentationWidth = max(1, tabWidth)
         let scaleChanged = context.coordinator.appliedFontScale != fontScale
         if scaleChanged || context.coordinator.appliedTabWidth != tabWidth {   // Settings changed font size / tab width
             let font = LaTeXEditorView.editorFont(scale: fontScale)

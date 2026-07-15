@@ -15,6 +15,13 @@ final class LineNumberRuler: NSRulerView {
         self.textView = textView
         super.init(scrollView: scrollView, orientation: .verticalRuler)
         clientView = textView
+        // NSRulerView normally reserves a 15pt marker strip and draws its own baseline. A line
+        // number gutter has neither markers nor an accessory view; leaving that strip enabled
+        // exposes the baseline above/outside the editor when the scroll view is tiled.
+        reservedThicknessForMarkers = 0
+        reservedThicknessForAccessoryView = 0
+        accessoryView = nil
+        markers = []
         updateTotalLines()
 
         let nc = NotificationCenter.default
@@ -33,6 +40,19 @@ final class LineNumberRuler: NSRulerView {
 
     /// Recompute the line count / thickness and redraw (text or font size changed).
     func refresh() { updateTotalLines(); needsDisplay = true }
+
+    /// Own the complete ruler drawing so NSRulerView does not add its default baseline or marker
+    /// strip. The trailing separator below is the only rule drawn by this gutter.
+    override func draw(_ dirtyRect: NSRect) {
+        let clipped = dirtyRect.intersection(bounds)
+        guard !clipped.isEmpty else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: clipped).addClip()
+        drawHashMarksAndLabels(in: clipped)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func drawMarkers(in rect: NSRect) {}
 
     private var digitFont: NSFont {
         let base = textView?.font ?? .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
@@ -97,6 +117,13 @@ final class LineNumberRuler: NSRulerView {
                 draw(totalLines, extra)
             }
         }
+
+        // A one-device-pixel semantic separator, kept inside the ruler's trailing edge.
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1
+        let separatorWidth = 1 / max(1, scale)
+        NSColor.separatorColor.setFill()
+        NSRect(x: bounds.maxX - separatorWidth, y: bounds.minY,
+               width: separatorWidth, height: bounds.height).fill()
     }
 
     private func newlineCount(_ ns: NSString, _ range: NSRange) -> Int {

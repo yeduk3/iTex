@@ -13,6 +13,10 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     PRODUCT_NAME: iTex
 
+packages:
+  NativeTerminal:
+    path: Packages/NativeTerminal
+
 targets:
   iTex-macOS:
     type: application
@@ -22,6 +26,9 @@ targets:
       - path: Sources
       - path: Resources
         buildPhase: resources
+    dependencies:
+      - package: NativeTerminal
+        product: NativeTerminal
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.gyu.iTex
@@ -34,6 +41,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Sources
+        excludes:
+          - ExternalTerminal.swift
       - path: Resources
         buildPhase: resources
     settings:

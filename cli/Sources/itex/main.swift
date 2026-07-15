@@ -82,12 +82,17 @@ do {
         workingDir = tmp
     }
 
-    let backend = LatexmkBackend()
-    let result = try await backend.compile(texPath: compileTex, workingDir: workingDir, engine: engine, profile: profile)
-
     // Place outputs where the caller expects them.
     let dest = outdir.map { URL(filePath: $0, directoryHint: .isDirectory) } ?? sourceDir
     try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+    let scratch = FileManager.default.temporaryDirectory
+        .appending(path: "itex-cli-build-\(UUID().uuidString)", directoryHint: .isDirectory)
+    try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scratch) }
+    let backend = LatexmkBackend()
+    let result = try await backend.compile(texPath: compileTex, cwd: workingDir, outDir: scratch,
+                                           engine: engine, profile: profile)
+
     let base = texPath.deletingPathExtension().lastPathComponent
     place(result.pdfURL, into: dest, named: base + ".pdf")
     if let syn = result.synctexURL { place(syn, into: dest, named: base + ".synctex.gz") }

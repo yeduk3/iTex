@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(macOS)
+import NativeTerminal
+#endif
 
 struct ContentView: View {
     @Binding var document: LaTeXDocument
@@ -17,6 +20,11 @@ struct ContentView: View {
 #if os(macOS)
     @State private var columnVisibility: NavigationSplitViewVisibility = .doubleColumn
     @StateObject private var quickOpen = QuickOpenController()
+    @State private var terminalSessionActive = false
+    @State private var terminalWorkingDirectory: URL?
+    @State private var showTerminal = false
+    @State private var terminalRevision = 0
+    @State private var terminalFocusRequest = 0
 #endif
 
     var body: some View {
@@ -82,15 +90,23 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
         } detail: {
             VStack(spacing: 0) {
-                editorPreviewSplit
+                editorPreviewSplit.frame(minHeight: 180)
                 if showProblems {
                     ProblemsPanel(store: diagnostics, onJump: handleProblemJump)
+                }
+                if terminalSessionActive, let directory = terminalWorkingDirectory {
+                    EmbeddedTerminalPanel(
+                        directory: directory,
+                        isVisible: showTerminal,
+                        revision: $terminalRevision,
+                        focusRequest: $terminalFocusRequest,
+                        onClose: closeTerminalSession)
                 }
             }
             .frame(minWidth: 560)
         }
         .navigationSplitViewStyle(.balanced)
-        .frame(minWidth: 700, minHeight: 500)
+        .frame(minWidth: 700, minHeight: minimumWindowHeight)
         .background {
             Button("Toggle Sidebar", action: toggleSidebar)
                 .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
@@ -108,6 +124,8 @@ struct ContentView: View {
         }
         .focusedSceneValue(\.quickOpenAction, { quickOpen.show(root: fileURL?.deletingLastPathComponent()) })
         .focusedSceneValue(\.problemsToggle, { showProblems.toggle() })
+        .focusedSceneValue(\.projectDirectory, fileURL?.deletingLastPathComponent())
+        .focusedSceneValue(\.embeddedTerminalToggle, terminalToggleAction)
 #else
         HStack(spacing: 0) {
             EditorView(source: $document.source, compiler: compiler,
@@ -119,6 +137,66 @@ struct ContentView: View {
     }
 
 #if os(macOS)
+    private var projectDirectory: URL? { fileURL?.deletingLastPathComponent() }
+
+    private var terminalToggleAction: (() -> Void)? {
+        guard projectDirectory != nil else { return nil }
+        return toggleTerminalPanel
+    }
+
+    private var minimumWindowHeight: CGFloat {
+        showTerminal && showProblems ? 650 : 500
+    }
+
+    /// Toggle panel visibility without ending an existing PTY session.
+    private func toggleTerminalPanel() {
+        guard projectDirectory != nil else { return }
+        if !terminalSessionActive {
+            terminalWorkingDirectory = projectDirectory?.standardizedFileURL
+            terminalSessionActive = true
+            showTerminal = true
+            terminalFocusRequest &+= 1
+        } else if showTerminal {
+            showTerminal = false
+            restoreEditorFocus()
+        } else {
+            showTerminal = true
+            terminalFocusRequest &+= 1
+        }
+    }
+
+    /// Explicit session close (X or terminal-focused Cmd+W) removes the representable and
+    /// therefore invokes NativeTerminalView.dismantleNSView/terminate.
+    private func closeTerminalSession() {
+        guard terminalSessionActive else { return }
+        showTerminal = false
+        terminalSessionActive = false
+        terminalWorkingDirectory = nil
+        restoreEditorFocus()
+    }
+
+    private func restoreEditorFocus() {
+        let window = NSApp.keyWindow
+        DispatchQueue.main.async { [weak window] in
+            guard let window else { return }
+            if let editor = Self.firstVisibleEditor(in: window.contentView),
+               window.makeFirstResponder(editor) {
+                return
+            }
+            // Never leave a collapsed terminal (or one being removed) as first responder.
+            window.makeFirstResponder(nil)
+        }
+    }
+
+    private static func firstVisibleEditor(in view: NSView?) -> LaTeXTextView? {
+        guard let view else { return nil }
+        if let editor = view as? LaTeXTextView, !editor.isHiddenOrHasHiddenAncestor { return editor }
+        for child in view.subviews {
+            if let editor = firstVisibleEditor(in: child) { return editor }
+        }
+        return nil
+    }
+
     private func toggleSidebar() {
         withAnimation(.easeInOut(duration: 0.22)) {
             columnVisibility = (columnVisibility == .detailOnly) ? .doubleColumn : .detailOnly
@@ -187,6 +265,14 @@ struct ContentView: View {
         }
 #if os(macOS)
         ToolbarItem(placement: .automatic) {
+            Button(action: toggleTerminalPanel) {
+                Label("Terminal", systemImage: "terminal")
+            }
+            .disabled(projectDirectory == nil)
+            .foregroundStyle(showTerminal ? Color.accentColor : Color.primary)
+            .help(showTerminal ? "Hide embedded terminal (⌃`)" : "Show embedded terminal (⌃`)")
+        }
+        ToolbarItem(placement: .automatic) {
             Button { Task { await compiler.forwardSearch() } }
                 label: { Label("Sync", systemImage: "scope") }
                 .keyboardShortcut(shortcuts.combo(.forwardSync).keyboardShortcut)
@@ -203,13 +289,27 @@ struct ContentView: View {
         }
 #endif
         ToolbarItem(placement: .automatic) {
-            if compiler.isCompiling {
-                ProgressView().controlSize(.small).help("Compiling…")
+            if compiler.isFinalBuilding {
+                ProgressView().controlSize(.small).help("Final build…")
+            } else if compiler.previewState == .buildingDraft {
+                ProgressView().controlSize(.small).help("Building draft preview…")
             } else {
                 Button { Task { await compiler.compile(source: document.source, profile: .finalCompile) } }
                     label: { Label("Build", systemImage: "hammer") }
                     .keyboardShortcut(shortcuts.combo(.build).keyboardShortcut)
                     .help("Final build: full-res images, rerun-until-stable + biber (\(shortcuts.combo(.build).display))")
+            }
+        }
+        ToolbarItem(placement: .automatic) {
+            if compiler.previewState == .loadingImages {
+                Label("Loading images…", systemImage: "photo.badge.arrow.down")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("The draft remains usable while screen-resolution images are prepared.")
+            } else if let imageError = compiler.imagePreviewError {
+                Image(systemName: "photo.badge.exclamationmark")
+                    .foregroundStyle(.secondary)
+                    .help("Image preview failed; keeping the draft.\n\(imageError)")
             }
         }
         ToolbarItem(placement: .automatic) {
@@ -226,6 +326,78 @@ struct ContentView: View {
 import AppKit
 import CoreServices
 import UniformTypeIdentifiers
+
+// MARK: - Embedded terminal
+
+private struct EmbeddedTerminalPanel: View {
+    let directory: URL
+    let isVisible: Bool
+    @Binding var revision: Int
+    @Binding var focusRequest: Int
+    let onClose: () -> Void
+
+    private var projectName: String {
+        directory.lastPathComponent.removingPercentEncoding ?? directory.lastPathComponent
+    }
+
+    private var sessionIdentity: String {
+        "\(directory.standardizedFileURL.path)#\(revision)"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 7) {
+                Image(systemName: "terminal")
+                Text("Terminal").fontWeight(.semibold)
+                Text(projectName)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer()
+                Button {
+                    revision &+= 1
+                    focusRequest &+= 1
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Restart terminal")
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Close terminal")
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(Color(nsColor: .controlBackgroundColor))
+
+            NativeTerminalView(
+                configuration: NativeTerminalConfiguration(workingDirectory: directory),
+                onCloseRequest: onClose,
+                focusRequest: focusRequest)
+                .id(sessionIdentity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(height: 260)
+        .background(Color(nsColor: .textBackgroundColor))
+        // Keep the 260pt terminal subtree alive while an outer clipped frame collapses the panel.
+        .frame(height: isVisible ? 260 : 0, alignment: .top)
+        .clipped()
+        .opacity(isVisible ? 1 : 0)
+        .allowsHitTesting(isVisible)
+        .accessibilityHidden(!isVisible)
+    }
+}
+
+struct EmbeddedTerminalToggleKey: FocusedValueKey { typealias Value = () -> Void }
+
+extension FocusedValues {
+    var embeddedTerminalToggle: (() -> Void)? {
+        get { self[EmbeddedTerminalToggleKey.self] }
+        set { self[EmbeddedTerminalToggleKey.self] = newValue }
+    }
+}
 
 // MARK: - Folder-grouped native window tabs
 
@@ -450,6 +622,8 @@ struct SidebarView: View {
                     } header: {
                         Text(root.lastPathComponent.removingPercentEncoding ?? root.lastPathComponent)
                             .contextMenu {
+                                Button("Open in Terminal") { ExternalTerminalLauncher.open(directory: root) }
+                                Divider()
                                 Button("New File…") { SidebarFileOps.newFile(in: root) }
                                 Button("New Folder…") { SidebarFileOps.newFolder(in: root) }
                             }
@@ -515,6 +689,8 @@ struct SidebarView: View {
     @ViewBuilder private func contextMenuItems(for url: URL) -> some View {
         let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
         if isDir {
+            Button("Open in Terminal") { ExternalTerminalLauncher.open(directory: url) }
+            Divider()
             Button("New File…") { SidebarFileOps.newFile(in: url) }
             Button("New Folder…") { SidebarFileOps.newFolder(in: url) }
             Divider()

@@ -20,15 +20,30 @@ struct SelectLineRequest: Equatable {
     let token: Int
 }
 
+enum PreviewState: Equatable {
+    case idle
+    case buildingDraft
+    case loadingImages
+    case ready
+    case failed
+}
+
 @MainActor
 @Observable
 final class LaTeXCompiler {
     var pdfURL: URL?
     var synctexURL: URL?
-    var isCompiling = false
+    var previewState: PreviewState = .idle
+    var isFinalBuilding = false
+    var isCompiling: Bool { previewState == .buildingDraft || isFinalBuilding }
     var errorMessage: String?
+    var imagePreviewError: String?
     var errorMessages: [Int: String] = [:]   // 1-based source line → error text, from last failed build
     var compilationID = 0
+    private(set) var previewGeneration: UInt64 = 0
+    private(set) var lastDraftDuration: TimeInterval?
+    private(set) var lastImagePreviewDuration: TimeInterval?
+    private(set) var lastImageProxyCount = 0
     // Auto-detected from the document each compile (detectEngine) — no engine picker.
     // All engines share the warm pre-started fast path; fontspec/CJK docs auto-route to xelatex.
     var engine: TexEngine = .pdflatex
@@ -51,13 +66,14 @@ final class LaTeXCompiler {
     var inSyncCooldown: Bool { CFAbsoluteTimeGetCurrent() < syncCooldownUntil }
 
     private var debounceTask: Task<Void, Never>?
+    private var imagePreviewTask: Task<Void, Never>?
     private let workDir: URL
-    /// The .tex actually handed to the engine. With a saved doc this is a build copy
-    /// (sibling of fileURL), so SyncTeX must use it, not fileURL.
+    private let sessionID = UUID().uuidString
+    /// The private .tex build copy actually handed to the engine, which SyncTeX must use.
     private var compiledTexURL: URL?
 #if os(macOS)
-    /// Warm pre-started engine for fast preview (all engines, docs/03 §3.3).
-    private let warmEngine = WarmEngine()
+    /// Owns the stable warm scratch. Completed PDFs are copied into generation-stage results.
+    private let draftCompiler = DraftPreviewCompiler()
 #endif
 
     init() {
@@ -117,27 +133,14 @@ final class LaTeXCompiler {
         }
     }
 
-    func compile(source: String, profile: CompileProfile = .finalCompile) async {
-        engine = Self.detectEngine(source)   // doc decides the engine, not the user
-        isCompiling = true
-        errorMessage = nil
-        defer { isCompiling = false }
-
-        do {
-            let result = try await buildPDF(source: source, profile: profile)
-            pdfURL = result.pdfURL
-            // Warm + latexmk paths both emit SyncTeX now; keep the last good one defensively.
-            if let syn = result.synctexURL { synctexURL = syn }
-            errorMessages = [:]
-            compilationID += 1
-#if os(macOS)
-            // Mirror the full build PDF next to the .tex (the user-facing output). Only on a real
-            // build — fast-preview saves draft images, so they stay in temp.
-            if profile == .finalCompile { exportPDF(from: result.pdfURL) }
-#endif
-        } catch {
-            errorMessage = (error as? CompilerError)?.displayMessage ?? error.localizedDescription
-            errorMessages = (error as? CompilerError).map(Self.errorMessages(from:)) ?? [:]
+    /// Save/open uses the two-stage preview by default. Original images are reserved for the
+    /// explicit `.finalCompile` toolbar action.
+    func compile(source: String, profile: CompileProfile = .fastPreview) async {
+        switch profile {
+        case .fastPreview, .imagePreview:
+            await compilePreview(source: source)
+        case .finalCompile:
+            await compileFinal(source: source)
         }
     }
 
@@ -171,17 +174,25 @@ final class LaTeXCompiler {
     /// stale PDF), then run a full compile from scratch.
     func cleanBuild(source: String) async {
 #if os(macOS)
-        await warmEngine.kill()
-        if let fileURL { try? FileManager.default.removeItem(at: buildDir(for: fileURL)) }
+        _ = nextGeneration()
+        await draftCompiler.shutdown()
+        if let fileURL {
+            try? FileManager.default.removeItem(at: documentRoot(for: fileURL).appending(path: "warm"))
+        }
 #endif
         await compile(source: source, profile: .finalCompile)
     }
 
 #if os(macOS)
-    /// Per-document scratch dir in the app's temp area — every build artifact lives here, never in
-    /// the user's source folder. Stable per file path so latexmk's incremental state persists.
-    private func buildDir(for fileURL: URL) -> URL {
-        workDir.appending(path: stableHash(fileURL.path), directoryHint: .isDirectory)
+    private func documentRoot(for fileURL: URL) -> URL {
+        workDir.appending(path: stableHash(fileURL.standardizedFileURL.path), directoryHint: .isDirectory)
+            .appending(path: sessionID, directoryHint: .isDirectory)
+    }
+
+    private func stageDir(for fileURL: URL, generation: UInt64, stage: String) -> URL {
+        documentRoot(for: fileURL)
+            .appending(path: String(generation), directoryHint: .isDirectory)
+            .appending(path: stage, directoryHint: .isDirectory)
     }
 
     /// Copy the freshly built PDF next to the source .tex as "<base>.pdf" — the only artifact that
@@ -191,77 +202,179 @@ final class LaTeXCompiler {
     private func exportPDF(from built: URL) {
         guard let fileURL else { return }
         let dest = fileURL.deletingPathExtension().appendingPathExtension("pdf")
-        try? FileManager.default.removeItem(at: dest)
-        try? FileManager.default.copyItem(at: built, to: dest)
+        let temporary = dest.deletingLastPathComponent()
+            .appending(path: ".\(dest.lastPathComponent).itex-\(UUID().uuidString).tmp")
+        do {
+            try FileManager.default.copyItem(at: built, to: temporary)
+            if FileManager.default.fileExists(atPath: dest.path) {
+                _ = try FileManager.default.replaceItemAt(dest, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: dest)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+        }
     }
 #endif
 
-    private func buildPDF(source: String, profile: CompileProfile) async throws -> CompileResult {
+    private func nextGeneration() -> UInt64 {
+        previewGeneration &+= 1
+        imagePreviewTask?.cancel()
+        imagePreviewTask = nil
+        return previewGeneration
+    }
+
+    private func publish(_ result: CompileResult) {
+        pdfURL = result.pdfURL
+        if let syn = result.synctexURL {
+            synctexURL = syn
+            compiledTexURL = result.compiledTexURL
+        }
+        compilationID &+= 1
+    }
+
+    private func compilePreview(source: String) async {
+        let generation = nextGeneration()
+        let selectedEngine = Self.detectEngine(source)
+        engine = selectedEngine
+        previewState = .buildingDraft
+        errorMessage = nil
+        imagePreviewError = nil
+        lastImagePreviewDuration = nil
+        lastImageProxyCount = 0
+        let started = Date()
+
 #if os(macOS)
-        // All build artifacts (build copy + outputs) live in a per-document temp dir, never in the
-        // user's source folder. `cwd` stays the source dir so relative \includegraphics/\input
-        // resolve; the user's file is NEVER written out-of-band (its own save is the only writer —
-        // touching it would bump mtime and trip NSDocument's "modified externally" conflict).
-        // ponytail: jobname is "<base>-itexbuild"; a doc that hardcodes \jobname would notice.
-        let texPath: URL, cwd: URL, outDir: URL
-        if let fileURL {
-            let base = fileURL.deletingPathExtension().lastPathComponent
-            cwd = fileURL.deletingLastPathComponent()
-            outDir = buildDir(for: fileURL)
-            try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-            let buildTex = outDir.appending(path: "\(base)-itexbuild.tex")
-            try Data(source.utf8).write(to: buildTex)
-            texPath = buildTex
-            compiledTexURL = buildTex
-        } else {
-            let tex = workDir.appending(path: "document.tex")
-            try Data(source.utf8).write(to: tex)
-            texPath = tex
-            cwd = workDir
-            outDir = workDir
-        }
-
-        // Fast preview → warm pre-started engine for ALL engines (docs/03 §3.3): pdflatex,
-        // xelatex (fontspec/kotex/xeCJK), lualatex all reuse the in-RAM preamble + fonts.
-        // Needs a saved doc (stable build-copy path) and the vendored fastrecompile.sty.
+        let sourceURL = fileURL ?? workDir.appending(path: "unsaved-\(sessionID)/document.tex")
+        try? FileManager.default.createDirectory(at: sourceURL.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        let root = documentRoot(for: sourceURL)
         let resources = Bundle.main.resourceURL?.path ?? ""
-        let styOK = !resources.isEmpty
-            && FileManager.default.fileExists(atPath: resources + "/fastrecompile.sty")
-        let canWarm = useWarmEngine && fileURL != nil && styOK
-        let preambleHash = canWarm ? stableHash(Self.preamble(of: source)) : ""
+        do {
+            let draft = try await draftCompiler.compile(
+                source: source, sourceURL: sourceURL, engine: selectedEngine,
+                warmRoot: root.appending(path: "warm", directoryHint: .isDirectory),
+                stageDir: stageDir(for: sourceURL, generation: generation, stage: "draft"),
+                resources: resources, useWarm: useWarmEngine && fileURL != nil
+            )
+            guard generation == previewGeneration else { return }
+            lastDraftDuration = -started.timeIntervalSinceNow
+            publish(draft)
+            errorMessages = [:]
 
-        if canWarm, profile == .fastPreview,
-           let r = await warmEngine.tryCompile(buildTex: texPath, engine: engine,
-                                               preambleHash: preambleHash, outDir: outDir) {
-            // Arm a fresh process so the next save is warm too (preamble pass runs during idle).
-            // ponytail: re-arms every fast preview — a wasted spawn during rapid typing, but it's
-            // background and each save still feeds the previously-warmed engine. Optimize if it bites.
-            await warmEngine.arm(buildTex: texPath, engine: engine, preambleHash: preambleHash,
-                                 cwd: cwd, outDir: outDir, resources: resources)
-            return r
-        }
+            let plan = ImagePreviewProject.plan(source: source, sourceURL: sourceURL,
+                                                recorderURL: draft.recorderURL)
+            guard plan.hasGraphics, fileURL != nil else {
+                previewState = .ready
+                return
+            }
 
-        // latexmk: finalCompile (rerun-until-stable + biber, the correctness backstop), a warm miss,
-        // or an unsaved doc. Kill any parked warm engine first — it shares jobname+outdir with
-        // latexmk, so a concurrent run corrupts <base>.xdv/.aux and wedges latexmk's error state.
-        // arm() below re-arms a fresh one for the next fast preview.
-        await warmEngine.kill()
-        let r = try await LatexmkBackend().compile(texPath: texPath, cwd: cwd, outDir: outDir, engine: engine, profile: profile)
-        if canWarm {
-            await warmEngine.arm(buildTex: texPath, engine: engine, preambleHash: preambleHash,
-                                 cwd: cwd, outDir: outDir, resources: resources)
+            previewState = .loadingImages
+            let imageStage = stageDir(for: sourceURL, generation: generation, stage: "images")
+            let cache = workDir.appending(path: "image-proxies", directoryHint: .isDirectory)
+            imagePreviewTask = Task { [weak self] in
+                guard let self else { return }
+                await self.finishImagePreview(plan: plan, source: source, sourceURL: sourceURL,
+                                              engine: selectedEngine, stageDir: imageStage,
+                                              cacheDir: cache, draft: draft,
+                                              generation: generation)
+            }
+        } catch {
+            guard generation == previewGeneration else { return }
+            previewState = .failed
+            errorMessage = (error as? CompilerError)?.displayMessage ?? error.localizedDescription
+            errorMessages = (error as? CompilerError).map(Self.errorMessages(from:)) ?? [:]
         }
-        return r
 #elseif ITEX_TECTONIC
-        // iOS: in-process Tectonic (no subprocess). Requires the FFI lib + a shipped local bundle.
         let tex = workDir.appending(path: "document.tex")
-        try Data(source.utf8).write(to: tex)
-        return try await TectonicBackend().compile(texPath: tex, cwd: workDir, outDir: workDir, engine: engine, profile: profile)
+        do {
+            try Data(source.utf8).write(to: tex)
+            let result = try await TectonicBackend().compile(texPath: tex, cwd: workDir, outDir: workDir,
+                                                             engine: selectedEngine, profile: .fastPreview)
+            guard generation == previewGeneration else { return }
+            lastDraftDuration = -started.timeIntervalSinceNow
+            publish(result)
+            previewState = .ready
+        } catch {
+            guard generation == previewGeneration else { return }
+            previewState = .failed
+            errorMessage = error.localizedDescription
+        }
 #else
-        // iOS without the Tectonic lib linked yet.
-        throw CompilerError.platformUnsupported
+        guard generation == previewGeneration else { return }
+        previewState = .failed
+        errorMessage = CompilerError.platformUnsupported.displayMessage
 #endif
     }
+
+#if os(macOS)
+    private func finishImagePreview(plan: ImagePreviewPlan, source: String, sourceURL: URL,
+                                    engine: TexEngine, stageDir: URL, cacheDir: URL,
+                                    draft: CompileResult, generation: UInt64) async {
+        let started = Date()
+        do {
+            let enhanced = try await ImagePreviewProject.compile(
+                plan: plan, source: source, sourceURL: sourceURL, engine: engine,
+                stageDir: stageDir, cacheDir: cacheDir, draftResult: draft
+            )
+            guard !Task.isCancelled, generation == previewGeneration else { return }
+            lastImagePreviewDuration = -started.timeIntervalSinceNow
+            lastImageProxyCount = enhanced.proxyCount
+            publish(enhanced.result)
+            previewState = .ready
+            imagePreviewTask = nil
+        } catch {
+            guard !Task.isCancelled, generation == previewGeneration else { return }
+            lastImagePreviewDuration = -started.timeIntervalSinceNow
+            imagePreviewError = (error as? CompilerError)?.displayMessage ?? error.localizedDescription
+            // The successful draft remains visible and its SyncTeX remains installed.
+            previewState = .ready
+            imagePreviewTask = nil
+        }
+    }
+
+    private func compileFinal(source: String) async {
+        let generation = nextGeneration()
+        let selectedEngine = Self.detectEngine(source)
+        engine = selectedEngine
+        isFinalBuilding = true
+        previewState = pdfURL == nil ? .buildingDraft : .ready
+        errorMessage = nil
+        imagePreviewError = nil
+        defer { isFinalBuilding = false }
+
+        let sourceURL = fileURL ?? workDir.appending(path: "unsaved-\(sessionID)/document.tex")
+        let stage = stageDir(for: sourceURL, generation: generation, stage: "final")
+        let sourceDir = stage.appending(path: "source", directoryHint: .isDirectory)
+        let work = stage.appending(path: "work", directoryHint: .isDirectory)
+        let tex = sourceDir.appending(path: sourceURL.deletingPathExtension().lastPathComponent + "-itexfinal.tex")
+        do {
+            try FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+            try Data(source.utf8).write(to: tex, options: .atomic)
+            let raw = try await LatexmkBackend().compile(
+                texPath: tex, cwd: sourceURL.deletingLastPathComponent(), outDir: work,
+                engine: selectedEngine, profile: .finalCompile
+            )
+            let result = try CompilePublication.publish(raw, into: stage)
+            guard generation == previewGeneration else { return }
+            publish(result)
+            exportPDF(from: result.pdfURL)
+            errorMessages = [:]
+            previewState = .ready
+        } catch {
+            guard generation == previewGeneration else { return }
+            errorMessage = (error as? CompilerError)?.displayMessage ?? error.localizedDescription
+            errorMessages = (error as? CompilerError).map(Self.errorMessages(from:)) ?? [:]
+            if pdfURL == nil { previewState = .failed }
+        }
+    }
+#else
+    private func compileFinal(source: String) async {
+        // Tectonic builds do not export on iOS; retain the same generation/stale semantics.
+        await compilePreview(source: source)
+    }
+#endif
 
     // MARK: - SyncTeX (docs/04 §4.3)
 
@@ -307,7 +420,10 @@ final class LaTeXCompiler {
     }
 
     /// Terminate the parked warm engine (call on document close so it doesn't outlive the window).
-    func shutdownWarm() async { await warmEngine.kill() }
+    func shutdownWarm() async {
+        imagePreviewTask?.cancel()
+        await draftCompiler.shutdown()
+    }
 #endif
 }
 

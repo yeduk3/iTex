@@ -21,10 +21,14 @@ struct iTexApp: App {
         .commands {
             // ⌘N opens a fresh launch screen (replaces DocumentGroup's "New Document").
             CommandGroup(replacing: .newItem) { NewWelcomeWindowButton() }
+            // File ▸ Open Project in Terminal, scoped to the focused saved document.
+            CommandGroup(after: .newItem) { OpenProjectInTerminalCommand() }
             // View ▸ font zoom (⌘+/⌘-/⌘0), applied live to every open editor.
             CommandGroup(after: .toolbar) { FontSizeCommands() }
             // View ▸ Show Problems (⇧⌘M), toggling the focused window's diagnostics panel.
             CommandGroup(after: .toolbar) { ProblemsCommands() }
+            // View ▸ Toggle Terminal, routed to the focused saved document window.
+            CommandGroup(after: .toolbar) { EmbeddedTerminalCommands() }
             // Edit ▸ Find (⌘F/⌘G/⇧⌘G/⌘⌥F), routed to the focused window's find controller.
             CommandGroup(after: .textEditing) { FindCommands() }
             // Window ▸ tab navigation (⌘⌥←/→), routed to the key window's native tab group.
@@ -50,6 +54,17 @@ private struct NewWelcomeWindowButton: View {
     var body: some View {
         Button("New Window") { openWindow(id: "welcome") }
             .keyboardShortcut("n", modifiers: .command)
+    }
+}
+
+/// File-menu terminal launcher; disabled for welcome and unsaved document windows.
+private struct OpenProjectInTerminalCommand: View {
+    @FocusedValue(\.projectDirectory) private var directory: URL?
+    var body: some View {
+        Button("Open Project in Terminal") {
+            if let directory { ExternalTerminalLauncher.open(directory: directory) }
+        }
+        .disabled(directory == nil)
     }
 }
 
@@ -103,6 +118,16 @@ private struct ProblemsCommands: View {
     var body: some View {
         Button("Show Problems") { toggle?() }
             .keyboardShortcut("m", modifiers: [.command, .shift])
+            .disabled(toggle == nil)
+    }
+}
+
+/// View-menu embedded terminal visibility toggle. It preserves a hidden session.
+private struct EmbeddedTerminalCommands: View {
+    @FocusedValue(\.embeddedTerminalToggle) private var toggle: (() -> Void)?
+    var body: some View {
+        Button("Toggle Terminal") { toggle?() }
+            .keyboardShortcut("`", modifiers: .control)
             .disabled(toggle == nil)
     }
 }
