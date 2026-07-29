@@ -68,12 +68,13 @@ func runSelfcheck() async {
     if FileManager.default.fileExists(atPath: big.path),
        let origSize = try? FileManager.default.attributesOfItem(atPath: big.path)[.size] as? Int, origSize > 0 {
         let cache = tmp.appending(path: ".cache")
-        if let proxy = ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1) {
+        if let proxy = await ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1) {
             let pSize = (try? FileManager.default.attributesOfItem(atPath: proxy.path)[.size] as? Int) ?? Int.max
             check("ImageProxyCache shrinks raster", pSize < origSize)
-            let reused = ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1)
+            let reused = await ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1)
             check("ImageProxyCache reuses unchanged image", reused == proxy)
-            if let before = ImageProxyCache.metadata(for: big), let after = ImageProxyCache.metadata(for: proxy) {
+            if let before = await ImageProxyCache.metadata(for: big),
+               let after = await ImageProxyCache.metadata(for: proxy) {
                 let naturalBefore = before.pixelWidth / before.dpiWidth
                 let naturalAfter = after.pixelWidth / after.dpiWidth
                 check("proxy preserves aspect ratio", abs(before.pixelWidth / before.pixelHeight - after.pixelWidth / after.pixelHeight) < 0.01)
@@ -83,7 +84,7 @@ func runSelfcheck() async {
             }
             try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(2)],
                                                    ofItemAtPath: big.path)
-            let invalidated = ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1)
+            let invalidated = await ImageProxyCache.proxy(for: big, maxDim: 600, cacheDir: cache, minBytes: 1)
             check("ImageProxyCache invalidates changed image", invalidated != nil && invalidated != proxy)
         } else {
             check("ImageProxyCache returned a proxy", false)
@@ -190,7 +191,8 @@ func runSelfcheck() async {
     // 8. A corrupt oversized raster fails proxying safely (mirror logic keeps its original link).
     let corrupt = assets.appending(path: "corrupt.png")
     try? Data(repeating: 0x55, count: 2_100_000).write(to: corrupt)
-    check("proxy failure returns fallback signal", ImageProxyCache.proxy(for: corrupt, cacheDir: tmp.appending(path: ".cache")) == nil)
+    check("proxy failure returns fallback signal",
+          await ImageProxyCache.proxy(for: corrupt, cacheDir: tmp.appending(path: ".cache")) == nil)
 
     print(failures == 0 ? "\nselfcheck: ALL PASS" : "\nselfcheck: \(failures) FAILURE(S)")
     if failures > 0 { exit(1) }

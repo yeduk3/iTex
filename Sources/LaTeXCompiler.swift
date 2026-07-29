@@ -35,7 +35,12 @@ final class LaTeXCompiler {
     var synctexURL: URL?
     var previewState: PreviewState = .idle
     var isFinalBuilding = false
-    var isCompiling: Bool { previewState == .buildingDraft || isFinalBuilding }
+    /// Includes the image-enhancement pass: it also owns a TeX subprocess and must be stoppable
+    /// from the Build command if it becomes wedged.
+    var isCompiling: Bool { activeCompileTask != nil || previewState == .loadingImages || isRestarting }
+    /// A clean restart has already been accepted and is stopping/cleaning before its replacement
+    /// compile starts. Repeated UI commands during this short phase are idempotent.
+    var restartInProgress: Bool { isRestarting }
     var errorMessage: String?
     var imagePreviewError: String?
     var errorMessages: [Int: String] = [:]   // 1-based source line → error text, from last failed build
@@ -67,6 +72,9 @@ final class LaTeXCompiler {
 
     private var debounceTask: Task<Void, Never>?
     private var imagePreviewTask: Task<Void, Never>?
+    private var activeCompileTask: Task<Void, Never>?
+    private var activeCompileToken: UInt64 = 0
+    private var isRestarting = false
     private let workDir: URL
     private let sessionID = UUID().uuidString
     /// The private .tex build copy actually handed to the engine, which SyncTeX must use.
@@ -136,12 +144,25 @@ final class LaTeXCompiler {
     /// Save/open uses the two-stage preview by default. Original images are reserved for the
     /// explicit `.finalCompile` toolbar action.
     func compile(source: String, profile: CompileProfile = .fastPreview) async {
-        switch profile {
-        case .fastPreview, .imagePreview:
-            await compilePreview(source: source)
-        case .finalCompile:
-            await compileFinal(source: source)
+        // Save/open notifications can arrive while a build is already running. Do not enqueue
+        // stale sources behind a slow compiler or overlap scratch-directory writes; an explicit
+        // user restart goes through `forceCleanRestart` below.
+        guard activeCompileTask == nil, !isRestarting else { return }
+        activeCompileToken &+= 1
+        let token = activeCompileToken
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch profile {
+            case .fastPreview, .imagePreview:
+                await self.compilePreview(source: source)
+            case .finalCompile:
+                await self.compileFinal(source: source)
+            }
         }
+        activeCompileTask = task
+        await task.value
+        guard token == activeCompileToken else { return }
+        activeCompileTask = nil
     }
 
     /// Map source line → error text from a TeX build log. Primary: `-file-line-error`
@@ -173,14 +194,46 @@ final class LaTeXCompiler {
     /// Force a clean rebuild: discard the document's cached build artifacts (latexmk state, aux,
     /// stale PDF), then run a full compile from scratch.
     func cleanBuild(source: String) async {
-#if os(macOS)
+        // Use the same managed sequence as a confirmed restart. This keeps the stop/cleanup phase
+        // visible to the command router and prevents an untracked cleanup from racing Build.
+        await forceCleanRestart(source: source)
+    }
+
+    /// Stop the exact build owned by this document, wait for its TeX process to exit, discard warm
+    /// state, and only then launch a fresh final compile. The generation/token bumps prevent an old
+    /// completion or `defer` from clearing/publishing over the replacement run.
+    func forceCleanRestart(source: String) async {
+        guard !isRestarting else { return }
+        isRestarting = true
+        debounceTask?.cancel()
+        debounceTask = nil
+
+        let previousTask = activeCompileTask
+        let previousImageTask = imagePreviewTask
+        activeCompileToken &+= 1
         _ = nextGeneration()
+        previousTask?.cancel()
+        previousImageTask?.cancel()
+        await previousTask?.value
+        await previousImageTask?.value
+        activeCompileTask = nil
+
+#if os(macOS)
         await draftCompiler.shutdown()
         if let fileURL {
             try? FileManager.default.removeItem(at: documentRoot(for: fileURL).appending(path: "warm"))
         }
 #endif
+        settleCancelledLoadingState()
+        isRestarting = false
         await compile(source: source, profile: .finalCompile)
+    }
+
+    private func settleCancelledLoadingState() {
+        isFinalBuilding = false
+        if previewState == .buildingDraft || previewState == .loadingImages {
+            previewState = pdfURL == nil ? .idle : .ready
+        }
     }
 
 #if os(macOS)
@@ -243,6 +296,13 @@ final class LaTeXCompiler {
         lastImagePreviewDuration = nil
         lastImageProxyCount = 0
         let started = Date()
+        defer {
+            // A cancelled backend may return without throwing. Never leave a current generation
+            // displaying an endless spinner, but never let an old generation settle a newer one.
+            if generation == previewGeneration, previewState == .buildingDraft {
+                previewState = pdfURL == nil ? .idle : .ready
+            }
+        }
 
 #if os(macOS)
         let sourceURL = fileURL ?? workDir.appending(path: "unsaved-\(sessionID)/document.tex")
@@ -341,7 +401,9 @@ final class LaTeXCompiler {
         previewState = pdfURL == nil ? .buildingDraft : .ready
         errorMessage = nil
         imagePreviewError = nil
-        defer { isFinalBuilding = false }
+        defer {
+            if generation == previewGeneration { isFinalBuilding = false }
+        }
 
         let sourceURL = fileURL ?? workDir.appending(path: "unsaved-\(sessionID)/document.tex")
         let stage = stageDir(for: sourceURL, generation: generation, stage: "final")
@@ -421,8 +483,16 @@ final class LaTeXCompiler {
 
     /// Terminate the parked warm engine (call on document close so it doesn't outlive the window).
     func shutdownWarm() async {
-        imagePreviewTask?.cancel()
+        let previousImageTask = imagePreviewTask
+        activeCompileToken &+= 1
+        _ = nextGeneration()
+        activeCompileTask?.cancel()
+        previousImageTask?.cancel()
+        await activeCompileTask?.value
+        await previousImageTask?.value
+        activeCompileTask = nil
         await draftCompiler.shutdown()
+        settleCancelledLoadingState()
     }
 #endif
 }

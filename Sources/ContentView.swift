@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var shortcuts     = ShortcutStore.shared
     @StateObject private var diagnostics = DiagnosticsStore()
     @State private var showProblems  = false
+    @State private var showCompileRestartConfirmation = false
     // true = editor/preview stacked top–bottom; false = side by side. Settings ⌘,.
     @AppStorage("previewSplitVertical") private var verticalSplit = false
     @AppStorage("showSidebar") private var showSidebar = true
@@ -30,6 +31,14 @@ struct ContentView: View {
     var body: some View {
         splitLayout
             .toolbar { toolbarContent }
+            .alert("Restart Compilation?", isPresented: $showCompileRestartConfirmation) {
+                Button("Cancel", role: .cancel) {}
+                Button("Stop & Restart", role: .destructive) {
+                    Task { await compiler.forceCleanRestart(source: document.source) }
+                }
+            } message: {
+                Text("A compilation is still running. Stop it and start a clean build from the beginning?")
+            }
             .task {
                 compiler.fileURL = fileURL
                 texLabClient.onDiagnostics = { diagnostics.setLSP($0) }
@@ -289,16 +298,20 @@ struct ContentView: View {
         }
 #endif
         ToolbarItem(placement: .automatic) {
-            if compiler.isFinalBuilding {
-                ProgressView().controlSize(.small).help("Final build…")
-            } else if compiler.previewState == .buildingDraft {
-                ProgressView().controlSize(.small).help("Building draft preview…")
-            } else {
-                Button { Task { await compiler.compile(source: document.source, profile: .finalCompile) } }
-                    label: { Label("Build", systemImage: "hammer") }
-                    .keyboardShortcut(shortcuts.combo(.build).keyboardShortcut)
-                    .help("Final build: full-res images, rerun-until-stable + biber (\(shortcuts.combo(.build).display))")
+            Button(action: requestFinalBuild) {
+                if compiler.isCompiling {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.small)
+                        Text("Build")
+                    }
+                } else {
+                    Label("Build", systemImage: "hammer")
+                }
             }
+            .keyboardShortcut(shortcuts.combo(.build).keyboardShortcut)
+            .help(compiler.isCompiling
+                  ? "Stop the current compilation and restart (\(shortcuts.combo(.build).display))"
+                  : "Final build: full-res images, rerun-until-stable + biber (\(shortcuts.combo(.build).display))")
         }
         ToolbarItem(placement: .automatic) {
             if compiler.previewState == .loadingImages {
@@ -313,11 +326,34 @@ struct ContentView: View {
             }
         }
         ToolbarItem(placement: .automatic) {
-            Button { Task { await compiler.cleanBuild(source: document.source) } }
-                label: { Label("Clean Build", systemImage: "arrow.triangle.2.circlepath") }
+            Button(action: requestCleanBuild) {
+                Label("Clean Build", systemImage: "arrow.triangle.2.circlepath")
+            }
                 .keyboardShortcut(shortcuts.combo(.cleanBuild).keyboardShortcut)
-                .disabled(compiler.isCompiling)
-                .help("Clean build: wipe cached artifacts, then full compile (\(shortcuts.combo(.cleanBuild).display))")
+                .help(compiler.isCompiling
+                      ? "Stop the current compilation and restart cleanly (\(shortcuts.combo(.cleanBuild).display))"
+                      : "Clean build: wipe cached artifacts, then full compile (\(shortcuts.combo(.cleanBuild).display))")
+        }
+    }
+
+    private func requestFinalBuild() {
+        // A previously accepted clean restart is already producing the requested outcome. Treat
+        // repeated button/shortcut presses as idempotent instead of showing a confirmation whose
+        // confirm action would have nothing additional to do.
+        guard !compiler.restartInProgress else { return }
+        if compiler.isCompiling {
+            showCompileRestartConfirmation = true
+        } else {
+            Task { await compiler.compile(source: document.source, profile: .finalCompile) }
+        }
+    }
+
+    private func requestCleanBuild() {
+        guard !compiler.restartInProgress else { return }
+        if compiler.isCompiling {
+            showCompileRestartConfirmation = true
+        } else {
+            Task { await compiler.cleanBuild(source: document.source) }
         }
     }
 }

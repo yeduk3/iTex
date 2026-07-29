@@ -62,7 +62,9 @@ enum Subprocess {
     static let texPATH = "/opt/homebrew/bin:/Library/TeX/texbin:/usr/local/bin:/usr/bin"
 
     static func run(_ args: [String], cwd: URL, launch: String = "/usr/bin/env") async -> (status: Int32, output: String) {
-        await withCheckedContinuation { cont in
+        let running = RunningSubprocess()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
             let p = Process()
             p.executableURL = URL(filePath: launch)
             p.currentDirectoryURL = cwd
@@ -85,11 +87,89 @@ enum Subprocess {
             p.terminationHandler = { proc in
                 handle.readabilityHandler = nil
                 sink.append((try? handle.readToEnd()) ?? Data())
+                running.finish()
                 cont.resume(returning: (proc.terminationStatus, sink.string()))
             }
-            do { try p.run() } catch {
+            do {
+                try p.run()
+                running.install(p)
+            } catch {
+                p.terminationHandler = nil
+                handle.readabilityHandler = nil
+                running.finish()
                 cont.resume(returning: (-1, error.localizedDescription))
             }
+            }
+        } onCancel: {
+            // `Task.cancel()` must reach the actual TeX process. Without this, generation checks
+            // hide stale results but latexmk can keep running forever and retain the loading UI.
+            running.cancel()
+        }
+    }
+}
+
+/// Per-invocation cancellation bridge. It deliberately owns exactly one `Process`, so cancelling
+/// a compile in one document window cannot affect compilers in other windows.
+private final class RunningSubprocess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    func install(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel { terminate(process) }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let process = process
+        lock.unlock()
+        if let process { terminate(process) }
+    }
+
+    func finish() {
+        lock.lock()
+        process = nil
+        lock.unlock()
+    }
+
+    private func terminate(_ process: Process) {
+        guard process.isRunning else { return }
+        // latexmk can have a TeX/biber child holding the output pipe open. Kill descendants before
+        // their parent so they cannot become orphans and keep `readToEnd()` blocked.
+        let pid = process.processIdentifier
+        ProcessTreeTermination.send(SIGTERM, to: pid)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+            if process.isRunning { ProcessTreeTermination.send(SIGKILL, to: pid) }
+        }
+    }
+}
+
+/// Darwin process-tree traversal scoped to a single launched compiler pid. This avoids a global
+/// `pkill latexmk` that could terminate another iTex document or an unrelated terminal build.
+private enum ProcessTreeTermination {
+    static func send(_ signal: Int32, to root: pid_t) {
+        for pid in descendants(of: root).reversed() { kill(pid, signal) }
+        kill(root, signal)
+    }
+
+    private static func descendants(of parent: pid_t) -> [pid_t] {
+        var capacity = 8
+        while true {
+            var children = [pid_t](repeating: 0, count: capacity)
+            let childCount = proc_listchildpids(parent, &children,
+                                                Int32(children.count * MemoryLayout<pid_t>.size))
+            guard childCount > 0 else { return [] }
+            let count = Int(childCount)
+            if count < capacity {
+                children.removeSubrange(count...)
+                return children + children.flatMap { descendants(of: $0) }
+            }
+            capacity *= 2
         }
     }
 }
@@ -194,6 +274,7 @@ struct ImagePreviewBackend: CompileBackend {
 // is killed and a fresh one is armed for the next edit (preamble pass amortized into idle time).
 actor WarmEngine {
     private var proc: Process?
+    private var compilingProc: Process?
     private var stdinHandle: FileHandle?
     private var outHandle: FileHandle?
     private var sink: OutputSink?
@@ -252,18 +333,32 @@ actor WarmEngine {
         else { return nil }
         // Consume: this parked process serves exactly one compile.
         proc = nil; stdinHandle = nil; outHandle = nil; self.sink = nil; armedKey = nil
+        compilingProc = p
 
         let path = buildTex.path
-        let status: Int32 = await withCheckedContinuation { cont in
-            DispatchQueue.global().async {
-                do { try sin.write(contentsOf: Data((path + "\n").utf8)) } catch {}
-                try? sin.close()                 // close → a body error hits EOF and exits, no hang
-                p.waitUntilExit()                // returns immediately if already exited (no handler race)
-                out.readabilityHandler = nil
-                if let d = try? out.readToEnd(), !d.isEmpty { sink.append(d) }
-                cont.resume(returning: p.terminationStatus)
+        let status: Int32 = await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                DispatchQueue.global().async {
+                    do { try sin.write(contentsOf: Data((path + "\n").utf8)) } catch {}
+                    try? sin.close()                 // close → a body error hits EOF and exits, no hang
+                    p.waitUntilExit()                // returns immediately if already exited (no handler race)
+                    out.readabilityHandler = nil
+                    if let d = try? out.readToEnd(), !d.isEmpty { sink.append(d) }
+                    cont.resume(returning: p.terminationStatus)
+                }
+            }
+        } onCancel: {
+            if p.isRunning {
+                let pid = p.processIdentifier
+                ProcessTreeTermination.send(SIGTERM, to: pid)
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                    if p.isRunning { ProcessTreeTermination.send(SIGKILL, to: pid) }
+                }
             }
         }
+        compilingProc = nil
+
+        guard !Task.isCancelled else { return nil }
 
         let base = buildTex.deletingPathExtension().lastPathComponent
         let pdf = outDir.appending(path: base + ".pdf")
@@ -280,11 +375,22 @@ actor WarmEngine {
     func kill() {
         if let p = proc, p.isRunning {
             try? stdinHandle?.close()
-            p.terminate()
+            let pid = p.processIdentifier
+            ProcessTreeTermination.send(SIGTERM, to: pid)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                if p.isRunning { ProcessTreeTermination.send(SIGKILL, to: pid) }
+            }
             p.waitUntilExit()
         }
+        if let p = compilingProc, p.isRunning {
+            let pid = p.processIdentifier
+            ProcessTreeTermination.send(SIGTERM, to: pid)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                if p.isRunning { ProcessTreeTermination.send(SIGKILL, to: pid) }
+            }
+        }
         outHandle?.readabilityHandler = nil
-        proc = nil; stdinHandle = nil; outHandle = nil; sink = nil; armedKey = nil
+        proc = nil; compilingProc = nil; stdinHandle = nil; outHandle = nil; sink = nil; armedKey = nil
     }
 }
 
@@ -311,12 +417,14 @@ enum ImageProxyCache {
     /// original is small enough / not a downscalable raster.
     @discardableResult
     static func proxy(for image: URL, maxDim: Int = 1600, cacheDir: URL,
-                      minBytes: Int = 2_000_000) -> URL? {
+                      minBytes: Int = 2_000_000) async -> URL? {
+        guard !Task.isCancelled else { return nil }
         let ext = image.pathExtension.lowercased()
         guard ["png", "jpg", "jpeg", "tiff", "tif"].contains(ext) else { return nil }
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: image.path),
               let size = attrs[.size] as? Int else { return nil }
-        let originalMetadata = metadata(for: image)
+        let originalMetadata = await metadata(for: image)
+        guard !Task.isCancelled else { return nil }
         let needsResize = originalMetadata.map {
             max($0.pixelWidth, $0.pixelHeight) > Double(maxDim)
         } ?? (size >= minBytes)
@@ -330,13 +438,15 @@ enum ImageProxyCache {
 
         let temporary = bucket.appending(path: ".proxy-\(UUID().uuidString)." + ext)
 
-        let p = Process()
-        p.executableURL = URL(filePath: "/usr/bin/sips")
-        p.arguments = ["-Z", "\(maxDim)", image.path, "--out", temporary.path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run(); p.waitUntilExit() } catch { return nil }
-        guard p.terminationStatus == 0, FileManager.default.fileExists(atPath: temporary.path) else {
+        let resize = await Subprocess.run(
+            ["-Z", "\(maxDim)", image.path, "--out", temporary.path],
+            cwd: image.deletingLastPathComponent(), launch: "/usr/bin/sips"
+        )
+        guard !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: temporary)
+            return nil
+        }
+        guard resize.status == 0, FileManager.default.fileExists(atPath: temporary.path) else {
             try? FileManager.default.removeItem(at: temporary)
             return nil
         }
@@ -344,11 +454,15 @@ enum ImageProxyCache {
         // sips keeps the original DPI while reducing pixels, which would shrink an image inserted
         // without width/height options. Scale DPI by the same pixel ratio so its TeX natural size
         // remains unchanged. Explicit-width images are unaffected, and aspect ratio is preserved by -Z.
-        if let before = originalMetadata, let after = metadata(for: temporary),
+        if let before = originalMetadata, let after = await metadata(for: temporary),
            before.pixelWidth > 0, before.pixelHeight > 0 {
             let sx = after.pixelWidth / before.pixelWidth
             let sy = after.pixelHeight / before.pixelHeight
-            setDPI(of: temporary, width: before.dpiWidth * sx, height: before.dpiHeight * sy)
+            await setDPI(of: temporary, width: before.dpiWidth * sx, height: before.dpiHeight * sy)
+        }
+        guard !Task.isCancelled else {
+            try? FileManager.default.removeItem(at: temporary)
+            return nil
         }
 
         do {
@@ -366,16 +480,13 @@ enum ImageProxyCache {
         }
     }
 
-    static func metadata(for image: URL) -> Metadata? {
-        let p = Process()
-        let pipe = Pipe()
-        p.executableURL = URL(filePath: "/usr/bin/sips")
-        p.arguments = ["-g", "pixelWidth", "-g", "pixelHeight", "-g", "dpiWidth", "-g", "dpiHeight", image.path]
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run(); p.waitUntilExit() } catch { return nil }
-        guard p.terminationStatus == 0 else { return nil }
-        let output = String(decoding: (try? pipe.fileHandleForReading.readToEnd()) ?? Data(), as: UTF8.self)
+    static func metadata(for image: URL) async -> Metadata? {
+        let result = await Subprocess.run(
+            ["-g", "pixelWidth", "-g", "pixelHeight", "-g", "dpiWidth", "-g", "dpiHeight", image.path],
+            cwd: image.deletingLastPathComponent(), launch: "/usr/bin/sips"
+        )
+        guard result.status == 0, !Task.isCancelled else { return nil }
+        let output = result.output
         func value(_ name: String) -> Double? {
             let pattern = "(?m)^\\s*" + NSRegularExpression.escapedPattern(for: name) + ":\\s*([0-9.]+)"
             guard let re = try? NSRegularExpression(pattern: pattern),
@@ -389,16 +500,13 @@ enum ImageProxyCache {
                         dpiHeight: value("dpiHeight") ?? 72)
     }
 
-    private static func setDPI(of image: URL, width: Double, height: Double) {
+    private static func setDPI(of image: URL, width: Double, height: Double) async {
         guard width.isFinite, height.isFinite, width > 0, height > 0 else { return }
-        let p = Process()
-        p.executableURL = URL(filePath: "/usr/bin/sips")
-        p.arguments = ["--setProperty", "dpiWidth", String(format: "%.6f", width),
-                       "--setProperty", "dpiHeight", String(format: "%.6f", height), image.path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
+        _ = await Subprocess.run(
+            ["--setProperty", "dpiWidth", String(format: "%.6f", width),
+             "--setProperty", "dpiHeight", String(format: "%.6f", height), image.path],
+            cwd: image.deletingLastPathComponent(), launch: "/usr/bin/sips"
+        )
     }
 }
 
@@ -466,16 +574,11 @@ actor DraftPreviewCompiler {
     func compile(source: String, sourceURL: URL, engine: TexEngine, warmRoot: URL,
                  stageDir: URL, resources: String, useWarm: Bool) async throws -> CompileResult {
         await acquire()
-        do {
-            let result = try await performCompile(source: source, sourceURL: sourceURL, engine: engine,
-                                                  warmRoot: warmRoot, stageDir: stageDir,
-                                                  resources: resources, useWarm: useWarm)
-            release()
-            return result
-        } catch {
-            release()
-            throw error
-        }
+        defer { release() }
+        try Task.checkCancellation()
+        return try await performCompile(source: source, sourceURL: sourceURL, engine: engine,
+                                        warmRoot: warmRoot, stageDir: stageDir,
+                                        resources: resources, useWarm: useWarm)
     }
 
     private func performCompile(source: String, sourceURL: URL, engine: TexEngine, warmRoot: URL,
@@ -495,6 +598,7 @@ actor DraftPreviewCompiler {
         if canWarm,
            let raw = await warm.tryCompile(buildTex: buildTex, engine: engine,
                                            preambleHash: preambleHash, outDir: warmRoot) {
+            try Task.checkCancellation()
             let published = try CompilePublication.publish(raw, into: stageDir)
             await warm.arm(buildTex: buildTex, engine: engine, preambleHash: preambleHash,
                            cwd: sourceURL.deletingLastPathComponent(), outDir: warmRoot,
@@ -502,11 +606,14 @@ actor DraftPreviewCompiler {
             return published
         }
 
+        try Task.checkCancellation()
         await warm.kill()
+        try Task.checkCancellation()
         let raw = try await LatexmkBackend().compile(
             texPath: buildTex, cwd: sourceURL.deletingLastPathComponent(), outDir: warmRoot,
             engine: engine, profile: .fastPreview
         )
+        try Task.checkCancellation()
         let published = try CompilePublication.publish(raw, into: stageDir)
         if canWarm {
             await warm.arm(buildTex: buildTex, engine: engine, preambleHash: preambleHash,
@@ -619,9 +726,10 @@ enum ImagePreviewProject {
                 if fm.fileExists(atPath: main.path) { try fm.removeItem(at: main) }
                 try atomicWrite(Data(source.utf8), to: main)
                 for image in plan.imageFiles where isInside(image, root: plan.projectRoot) {
+                    try Task.checkCancellation()
                     guard let relative = relativePath(image, under: plan.projectRoot) else { continue }
                     let mirrored = mirror.appending(path: relative)
-                    if let proxy = ImageProxyCache.proxy(for: image, cacheDir: cacheDir) {
+                    if let proxy = await ImageProxyCache.proxy(for: image, cacheDir: cacheDir) {
                         if fm.fileExists(atPath: mirrored.path) { try fm.removeItem(at: mirrored) }
                         try fm.createSymbolicLink(at: mirrored, withDestinationURL: proxy)
                         proxyCount += 1
@@ -632,6 +740,8 @@ enum ImagePreviewProject {
                 }
                 texPath = main
                 cwd = mirror
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 originalFallback = true
                 try? fm.removeItem(at: mirror)
@@ -649,8 +759,10 @@ enum ImagePreviewProject {
             cwd = plan.projectRoot
         }
 
+        try Task.checkCancellation()
         let raw = try await ImagePreviewBackend().compile(texPath: texPath, cwd: cwd, outDir: work,
                                                           engine: engine, profile: .imagePreview)
+        try Task.checkCancellation()
         let result = try CompilePublication.publish(raw, into: stageDir, fallbackSync: draftResult)
         return ImagePreviewBuild(result: result, proxyCount: proxyCount,
                                  originalFallbackCount: fallbackCount,

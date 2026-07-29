@@ -87,7 +87,7 @@ struct ProblemsPanel: View {
                 .padding(.horizontal, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView {
+                ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(items) { d in
                             Button { onJump(d) } label: { ProblemRow(diagnostic: d) }
@@ -96,6 +96,7 @@ struct ProblemsPanel: View {
                         }
                     }
                 }
+                .defaultScrollAnchor(.topLeading)
             }
         }
         .frame(height: 170)
@@ -118,7 +119,8 @@ private struct ProblemRow: View {
             Text(location)
                 .font(.caption.monospaced()).foregroundStyle(.secondary)
             Text(diagnostic.message)
-                .lineLimit(1).truncationMode(.tail)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12).padding(.vertical, 4)

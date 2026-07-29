@@ -9,6 +9,51 @@ import Combine
 final class LaTeXTextView: NSTextView {
     enum CompletionContext { case command, brace, option, none }
 
+    // MARK: - LaTeX structure decoration
+
+    /// The latest lightweight parse. The ruler consumes this snapshot without reparsing text.
+    internal private(set) var structureSnapshot: LaTeXStructureSnapshot = .empty
+    /// Pairs containing the caret, ordered from the outermost environment to the innermost.
+    internal private(set) var activeEnvironmentPairs: [LaTeXEnvironmentPair] = []
+
+    /// A stable six-color depth palette shared with the gutter's scope annotations.
+    static func pairColor(forDepth depth: Int) -> NSColor {
+        let palette: [NSColor] = [
+            .systemTeal, .systemPurple, .systemOrange,
+            .systemPink, .systemGreen, .systemIndigo,
+        ]
+        return palette[max(0, depth) % palette.count]
+    }
+
+    /// Reparse only after source changes, then run syntax and structural foreground decoration
+    /// as one pass so a regular syntax refresh cannot erase environment colors.
+    func refreshStructureHighlighting() {
+        let snapshot = LaTeXStructureAnalyzer.analyze(string)
+        structureSnapshot = snapshot
+        updateActiveEnvironmentPairs(repaint: false)
+        if let lm = layoutManager {
+            Syntax.apply(to: lm, string: string, structureSnapshot: snapshot)
+        }
+        needsDisplay = true
+        enclosingScrollView?.verticalRulerView?.needsDisplay = true
+    }
+
+    /// Selection changes reuse the latest snapshot; moving the caret never reparses the buffer.
+    private func updateActiveEnvironmentPairs(repaint: Bool = true) {
+        let length = (string as NSString).length
+        let offset = min(selectedRange().location, length)
+        activeEnvironmentPairs = structureSnapshot
+            .pairs(containingUTF16Offset: offset)
+            .sorted { lhs, rhs in
+                if lhs.depth != rhs.depth { return lhs.depth < rhs.depth }
+                return lhs.fullRange.length > rhs.fullRange.length
+            }
+        if repaint {
+            needsDisplay = true
+            enclosingScrollView?.verticalRulerView?.needsDisplay = true
+        }
+    }
+
     /// Classify the cursor position for completion: `\command`, `\cmd{arg`, `\cmd[opt`, or none.
     func completionContext(at loc: Int) -> CompletionContext {
         let ns = string as NSString
@@ -145,6 +190,7 @@ final class LaTeXTextView: NSTextView {
     private var highlightLineRect: NSRect?
     func handleSelectionChange() {
         errorPopover.close()
+        updateActiveEnvironmentPairs()
         // Caret leaving the snippet's overall span ends the session (programmatic stop moves stay inside).
         if snippetActive {
             let sel = selectedRange()
@@ -885,39 +931,58 @@ final class LaTeXTextView: NSTextView {
     }
 
     private func indentSelection() {
-        rewriteSelectedLines { self.indentUnit + $0 }
-    }
-
-    private func dedentSelection() {
         let ns = string as NSString
         let originalSelection = selectedRange()
-        let lineRange = ns.lineRange(for: originalSelection)
+        let lineRange = affectedLineRange(in: ns, for: originalSelection)
         let block = ns.substring(with: lineRange)
         let trailingNL = block.hasSuffix("\n")
         var lines = block.components(separatedBy: "\n")
         if trailingNL { lines.removeLast() }
 
-        var removedPerLine: [Int] = []
+        let insertedLength = (indentUnit as NSString).length
+        var oldOffset = 0
+        var edits: [LinePrefixEdit] = []
+        let newLines = lines.map { line -> String in
+            edits.append(LinePrefixEdit(
+                location: lineRange.location + oldOffset,
+                removedLength: 0,
+                insertedLength: insertedLength
+            ))
+            oldOffset += (line as NSString).length + 1
+            return indentUnit + line
+        }
+        let newBlock = newLines.joined(separator: "\n") + (trailingNL ? "\n" : "")
+        replace(range: lineRange, with: newBlock,
+                newSelection: remapSelection(originalSelection, through: edits))
+    }
+
+    private func dedentSelection() {
+        let ns = string as NSString
+        let originalSelection = selectedRange()
+        let lineRange = affectedLineRange(in: ns, for: originalSelection)
+        let block = ns.substring(with: lineRange)
+        let trailingNL = block.hasSuffix("\n")
+        var lines = block.components(separatedBy: "\n")
+        if trailingNL { lines.removeLast() }
+
+        var oldOffset = 0
+        var edits: [LinePrefixEdit] = []
         let newLines = lines.map { line -> String in
             let source = line as NSString
             let remove = self.dedentPrefixLength(in: source)
-            removedPerLine.append(remove)
+            if remove > 0 {
+                edits.append(LinePrefixEdit(
+                    location: lineRange.location + oldOffset,
+                    removedLength: remove,
+                    insertedLength: 0
+                ))
+            }
+            oldOffset += source.length + 1
             return source.substring(from: remove)
         }
         let newBlock = newLines.joined(separator: "\n") + (trailingNL ? "\n" : "")
-
-        let newSelection: NSRange
-        if originalSelection.length == 0 {
-            // Keep the caret attached to the same content; if it was inside removed whitespace,
-            // clamp it to the new line start instead of selecting the rewritten line.
-            let removed = removedPerLine.first ?? 0
-            let column = originalSelection.location - lineRange.location
-            newSelection = NSRange(location: lineRange.location + max(0, column - removed), length: 0)
-        } else {
-            // Indentation is a line operation: keep all affected rewritten lines selected.
-            newSelection = NSRange(location: lineRange.location, length: (newBlock as NSString).length)
-        }
-        replace(range: lineRange, with: newBlock, newSelection: newSelection)
+        replace(range: lineRange, with: newBlock,
+                newSelection: remapSelection(originalSelection, through: edits))
     }
 
     /// One indentation level is one leading tab, otherwise up to the configured number of
@@ -932,16 +997,50 @@ final class LaTeXTextView: NSTextView {
         return count
     }
 
-    private func rewriteSelectedLines(_ transform: (String) -> String) {
-        let ns = string as NSString
-        let lineRange = ns.lineRange(for: selectedRange())
-        let block = ns.substring(with: lineRange)
-        let trailingNL = block.hasSuffix("\n")
-        var lines = block.components(separatedBy: "\n")
-        if trailingNL { lines.removeLast() }
-        let newBlock = lines.map(transform).joined(separator: "\n") + (trailingNL ? "\n" : "")
-        replace(range: lineRange, with: newBlock,
-                newSelection: NSRange(location: lineRange.location, length: (newBlock as NSString).length))
+    private struct LinePrefixEdit {
+        let location: Int
+        let removedLength: Int
+        let insertedLength: Int
+    }
+
+    /// Return the complete lines touched by the selection's characters. In particular, a
+    /// selection ending exactly at the next line's first character does not include that line.
+    private func affectedLineRange(in text: NSString, for selection: NSRange) -> NSRange {
+        guard selection.length > 0 else { return text.lineRange(for: selection) }
+        let firstLine = text.lineRange(for: NSRange(location: selection.location, length: 0))
+        let lastLine = text.lineRange(for: NSRange(location: NSMaxRange(selection) - 1, length: 0))
+        return NSRange(location: firstLine.location,
+                       length: NSMaxRange(lastLine) - firstLine.location)
+    }
+
+    /// Keep the selection attached to the originally selected text while line prefixes change.
+    /// At an inserted prefix, the leading selection edge stays after it and the trailing edge
+    /// stays before it; insertions on interior lines naturally remain inside the selection.
+    private func remapSelection(_ selection: NSRange, through edits: [LinePrefixEdit]) -> NSRange {
+        let start = remapLocation(selection.location, through: edits,
+                                  afterInsertionAtBoundary: true)
+        let end = remapLocation(NSMaxRange(selection), through: edits,
+                                afterInsertionAtBoundary: false)
+        return NSRange(location: start, length: max(0, end - start))
+    }
+
+    private func remapLocation(_ location: Int, through edits: [LinePrefixEdit],
+                               afterInsertionAtBoundary: Bool) -> Int {
+        var delta = 0
+        for edit in edits {
+            let editEnd = edit.location + edit.removedLength
+            if location < edit.location { break }
+
+            if edit.removedLength == 0, location == edit.location {
+                return edit.location + delta
+                    + (afterInsertionAtBoundary ? edit.insertedLength : 0)
+            }
+            if location <= editEnd {
+                return edit.location + delta + edit.insertedLength
+            }
+            delta += edit.insertedLength - edit.removedLength
+        }
+        return location + delta
     }
 
     @discardableResult
@@ -998,6 +1097,12 @@ final class LaTeXTextView: NSTextView {
             NSColor.selectedTextBackgroundColor.withAlphaComponent(0.12).setFill()
             r.fill()
         }
+        // Keep the active environment local and legible: only its two names get a subtle pill,
+        // leaving selections, find hits, and the body of nested environments unobscured.
+        if let pair = activeEnvironmentPairs.last {
+            drawActiveEnvironmentName(pair.beginNameRange, depth: pair.depth, dirtyRect: rect)
+            drawActiveEnvironmentName(pair.endNameRange, depth: pair.depth, dirtyRect: rect)
+        }
         guard !errorInfo.isEmpty, let lm = layoutManager, let tc = textContainer else { return }
         NSColor.systemRed.withAlphaComponent(0.12).setFill()
         for line in errorInfo.keys {
@@ -1007,6 +1112,32 @@ final class LaTeXTextView: NSTextView {
             r.size.width = bounds.width
             r.fill()
         }
+    }
+
+    private func drawActiveEnvironmentName(_ characterRange: NSRange, depth: Int, dirtyRect: NSRect) {
+        guard characterRange.length > 0,
+              NSMaxRange(characterRange) <= (string as NSString).length,
+              let lm = layoutManager, let tc = textContainer else { return }
+        let origin = textContainerOrigin
+        let containerRect = dirtyRect.offsetBy(dx: -origin.x, dy: -origin.y)
+        let visibleGlyphs = lm.glyphRange(forBoundingRect: containerRect, in: tc)
+        let visibleCharacters = lm.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
+        guard NSIntersectionRange(characterRange, visibleCharacters).length > 0 else { return }
+        let glyphRange = lm.glyphRange(forCharacterRange: characterRange, actualCharacterRange: nil)
+        guard glyphRange.length > 0 else { return }
+        var nameRect = lm.boundingRect(forGlyphRange: glyphRange, in: tc)
+        nameRect.origin.x += origin.x
+        nameRect.origin.y += origin.y
+        nameRect = nameRect.insetBy(dx: -2.5, dy: 0.5)
+        guard nameRect.intersects(dirtyRect) else { return }
+
+        let color = Self.pairColor(forDepth: depth)
+        color.withAlphaComponent(0.14).setFill()
+        color.withAlphaComponent(0.55).setStroke()
+        let path = NSBezierPath(roundedRect: nameRect, xRadius: 3, yRadius: 3)
+        path.lineWidth = 1
+        path.fill()
+        path.stroke()
     }
 
     /// Full-width rect of the caret's line fragment (view coordinates), for the current-line highlight.
@@ -1131,15 +1262,35 @@ private enum Syntax {
         Rule(pattern: try! NSRegularExpression(pattern: p), color: c)
     }
 
-    static func apply(to lm: NSLayoutManager, string: String) {
+    static func apply(to lm: NSLayoutManager, string: String,
+                      structureSnapshot: LaTeXStructureSnapshot) {
         guard string.count < 300_000 else { return }
         let full = NSRange(string.startIndex..., in: string)
         lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: full)
+        lm.removeTemporaryAttribute(.underlineStyle, forCharacterRange: full)
+        lm.removeTemporaryAttribute(.underlineColor, forCharacterRange: full)
         for rule in rules {
             rule.pattern.enumerateMatches(in: string, range: full) { m, _, _ in
                 guard let m else { return }
                 lm.addTemporaryAttribute(.foregroundColor, value: rule.color, forCharacterRange: m.range)
             }
+        }
+        // Apply pair colors after ordinary syntax so only parsed environment names override the
+        // token palette. Commands, braces, comments, and ignored/verbatim regions stay untouched.
+        for pair in structureSnapshot.pairs {
+            let color = LaTeXTextView.pairColor(forDepth: pair.depth)
+            for range in [pair.beginNameRange, pair.endNameRange]
+            where range.length > 0 && NSMaxRange(range) <= full.length {
+                lm.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: range)
+            }
+        }
+        let issueUnderline = NSUnderlineStyle.single.union(.patternDot).rawValue
+        for issue in structureSnapshot.issues
+        where issue.range.length > 0 && NSMaxRange(issue.range) <= full.length {
+            lm.addTemporaryAttribute(.underlineStyle, value: issueUnderline,
+                                     forCharacterRange: issue.range)
+            lm.addTemporaryAttribute(.underlineColor, value: NSColor.systemRed,
+                                     forCharacterRange: issue.range)
         }
     }
 }
@@ -1224,6 +1375,12 @@ struct LaTeXEditorView: NSViewRepresentable {
         tv.textContainer?.widthTracksTextView = true
         tv.delegate = context.coordinator
 
+        // Seed the initial buffer and its structure before the first SwiftUI update pass.
+        tv.string = text
+        tv.textStorage?.addAttribute(.paragraphStyle, value: tabStyle,
+            range: NSRange(location: 0, length: (text as NSString).length))
+        tv.refreshStructureHighlighting()
+
         scrollView.documentView = tv
         context.coordinator.textView = tv
         scrollView.contentView.postsBoundsChangedNotifications = true
@@ -1270,7 +1427,7 @@ struct LaTeXEditorView: NSViewRepresentable {
                 tv.textStorage?.addAttribute(.paragraphStyle, value: style,
                     range: NSRange(location: 0, length: (text as NSString).length))
             }
-            if let lm = tv.layoutManager { Syntax.apply(to: lm, string: text) }
+            tv.refreshStructureHighlighting()
             context.coordinator.findMatchesStale = true   // ranges shifted → recompute find on next pass
             context.coordinator.lineRuler?.refresh()      // direct string set posts no didChange notification
         }
@@ -1368,7 +1525,7 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     func textDidChange(_ notification: Notification) {
         guard let tv = notification.object as? NSTextView else { return }
         parent.text = tv.string
-        if let lm = tv.layoutManager { Syntax.apply(to: lm, string: tv.string) }
+        (tv as? LaTeXTextView)?.refreshStructureHighlighting()
         findMatchesStale = true   // ranges shifted; recompute on the next applyFind pass
     }
 

@@ -71,7 +71,7 @@ do {
         var shrunk = 0
         for img in includedImages(in: src, baseDir: sourceDir) {
             let dst = tmp.appending(path: img.lastPathComponent)
-            if let proxy = ImageProxyCache.proxy(for: img, cacheDir: tmp.appending(path: ".cache")) {
+            if let proxy = await ImageProxyCache.proxy(for: img, cacheDir: tmp.appending(path: ".cache")) {
                 try? FileManager.default.copyItem(at: proxy, to: dst); shrunk += 1
             } else {
                 try? FileManager.default.copyItem(at: img, to: dst)
