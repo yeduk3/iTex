@@ -18,7 +18,7 @@ struct LaTeXDocument: FileDocument {
     static var readableContentTypes: [UTType] { [.latexSource, .plainText] }
     static var writableContentTypes: [UTType] { [.latexSource] }
 
-    init(source: String = defaultSource) {
+    init(source: String = defaultLaTeXSource) {
         id = UUID()
         self.source = source
     }
@@ -44,7 +44,7 @@ struct LaTeXDocument: FileDocument {
     }
 }
 
-private let defaultSource = #"""
+let defaultLaTeXSource = #"""
 \documentclass{article}
 \usepackage{amsmath}
 

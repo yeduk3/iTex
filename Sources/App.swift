@@ -19,8 +19,8 @@ struct iTexApp: App {
         .windowResizability(.contentSize)
         .defaultPosition(.center)
         .commands {
-            // ⌘N opens a fresh launch screen (replaces DocumentGroup's "New Document").
-            CommandGroup(replacing: .newItem) { NewWelcomeWindowButton() }
+            CommandGroup(replacing: .newItem) { WorkspaceFileCommands() }
+            CommandGroup(replacing: .saveItem) { WorkspaceSaveCommands() }
             // File ▸ Open Project in Terminal, scoped to the focused saved document.
             CommandGroup(after: .newItem) { OpenProjectInTerminalCommand() }
             // View ▸ font zoom (⌘+/⌘-/⌘0), applied live to every open editor.
@@ -31,29 +31,60 @@ struct iTexApp: App {
             CommandGroup(after: .toolbar) { EmbeddedTerminalCommands() }
             // Edit ▸ Find (⌘F/⌘G/⇧⌘G/⌘⌥F), routed to the focused window's find controller.
             CommandGroup(after: .textEditing) { FindCommands() }
-            // Window ▸ tab navigation (⌘⌥←/→), routed to the key window's native tab group.
+            // Window ▸ tab navigation (⌘⌥←/→), routed to the focused project's editor tabs.
             CommandGroup(after: .windowArrangement) { TabCommands() }
             // Replace the default Print (⌘P) — a LaTeX editor doesn't print source — with the
             // quick-open palette on the same shortcut, routed to the focused window.
             CommandGroup(replacing: .printItem) { QuickOpenCommand() }
         }
-#endif
+
+        WindowGroup("iTex Project", for: ProjectLaunch.self) { launch in
+            if let launch = launch.wrappedValue {
+                ProjectWorkspaceView(initialURL: launch.fileURL)
+            } else {
+                ContentUnavailableView("No Project", systemImage: "folder")
+            }
+        }
+        .defaultSize(width: 1200, height: 780)
+
+        Settings { ShortcutSettingsView() }   // ⌘, opens this automatically
+#else
         DocumentGroup(newDocument: LaTeXDocument()) { config in
             ContentView(document: config.$document, fileURL: config.fileURL)
         }
-#if os(macOS)
-        Settings { ShortcutSettingsView() }   // ⌘, opens this automatically
 #endif
     }
 }
 
 #if os(macOS)
-/// File ▸ New Window (⌘N): opens another welcome/launch window. A View so it can read openWindow.
-private struct NewWelcomeWindowButton: View {
+private struct WorkspaceFileCommands: View {
     @Environment(\.openWindow) private var openWindow
+
     var body: some View {
-        Button("New Window") { openWindow(id: "welcome") }
+        Button("New Document") {
+            WorkspaceLauncher.newDocument { openWindow(value: $0) }
+        }
             .keyboardShortcut("n", modifiers: .command)
+        Button("Open…") {
+            WorkspaceLauncher.openDocument { openWindow(value: $0) }
+        }
+            .keyboardShortcut("o", modifiers: .command)
+        Divider()
+        Button("New Welcome Window") { openWindow(id: "welcome") }
+    }
+}
+
+private struct WorkspaceSaveCommands: View {
+    @FocusedValue(\.workspaceSaveAction) private var save: (() -> Void)?
+    @FocusedValue(\.workspaceSaveAllAction) private var saveAll: (() -> Void)?
+
+    var body: some View {
+        Button("Save") { save?() }
+            .keyboardShortcut("s", modifiers: .command)
+            .disabled(save == nil)
+        Button("Save All") { saveAll?() }
+            .keyboardShortcut("s", modifiers: [.command, .option])
+            .disabled(saveAll == nil)
     }
 }
 
@@ -82,14 +113,19 @@ private struct FontSizeCommands: View {
     }
 }
 
-/// Window-menu native tab navigation: ⌘⌥← / ⌘⌥→ select the previous/next tab of the key window.
+/// Window-menu project editor navigation: the shared PDF viewer is not part of this tab switch.
 private struct TabCommands: View {
+    @FocusedValue(\.workspacePreviousTabAction) private var previous: (() -> Void)?
+    @FocusedValue(\.workspaceNextTabAction) private var next: (() -> Void)?
+
     var body: some View {
         Divider()
-        Button("Show Previous Tab") { NSApp.keyWindow?.selectPreviousTab(nil) }
+        Button("Show Previous Editor") { previous?() }
             .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
-        Button("Show Next Tab") { NSApp.keyWindow?.selectNextTab(nil) }
+            .disabled(previous == nil)
+        Button("Show Next Editor") { next?() }
             .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+            .disabled(next == nil)
     }
 }
 

@@ -102,6 +102,7 @@ final class LaTeXCompiler {
     func configureProject(_ context: LaTeXProjectContext?) {
         projectContext = context
         if let context { fileURL = context.currentFile }
+        refreshInlineDiagnostics()
     }
 
     /// Pick the TeX engine from the document — the engine is a compatibility choice the
@@ -346,9 +347,16 @@ final class LaTeXCompiler {
             compiledRoot: compiledRoot ?? compiledTexURL
         )
         buildDiagnostics = parsed
+        refreshInlineDiagnostics()
+    }
+
+    /// Re-scope already parsed project diagnostics to the editor tab that is currently active.
+    /// Switching source tabs must not compile (or disturb the shared PDF), but its inline
+    /// annotations still need to follow the selected file.
+    private func refreshInlineDiagnostics() {
         let current = fileURL?.standardizedFileURL
         errorMessages = Dictionary(
-            grouping: parsed.filter {
+            grouping: buildDiagnostics.filter {
                 guard let file = $0.file?.standardizedFileURL else { return current == nil }
                 return file == current
             },

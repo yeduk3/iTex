@@ -5,13 +5,15 @@ struct EditorView: View {
     let compiler: LaTeXCompiler
     let linter: ChkTexLinter
     var texLabClient: TexLabClient?
+    var documentURL: URL? = nil
+    var isActive = true
     @AppStorage("editorTabWidth") private var tabWidth = 2
     @ObservedObject private var fontScale = FontScale.shared
     @StateObject private var find = FindController()
 
     /// Compile-failure messages + chktex errors, keyed by source line.
     private var mergedErrors: [Int: String] {
-        var m = compiler.errorMessages
+        var m = isActive ? compiler.errorMessages : [:]
         for w in linter.warnings where w.isError {
             m[w.line] = m[w.line].map { $0 + "\n" + w.message } ?? w.message
         }
@@ -21,7 +23,7 @@ struct EditorView: View {
     var body: some View {
         content
 #if os(macOS)
-            .focusedSceneValue(\.findController, find)
+            .focusedSceneValue(\.findController, isActive ? find : nil)
 #endif
     }
 
@@ -43,6 +45,7 @@ struct EditorView: View {
         // Errors surface inline (red line + hover/⌘. popover). Full-message banner removed
         // — compiler.errorMessage kept for a future dedicated panel.
         LaTeXEditorView(text: $source, texLabClient: texLabClient, compiler: compiler,
+                        documentURL: documentURL, isActive: isActive,
                         errorMessages: mergedErrors,
                         selectReq: compiler.selectLineRequest, scrollReq: compiler.scrollToLineRequest,
                         tabWidth: tabWidth, fontScale: fontScale.scale, find: find)

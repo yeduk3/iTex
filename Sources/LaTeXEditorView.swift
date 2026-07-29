@@ -1301,6 +1301,8 @@ struct LaTeXEditorView: NSViewRepresentable {
     @Binding var text: String
     var texLabClient: TexLabClient?
     var compiler: LaTeXCompiler?
+    var documentURL: URL?
+    var isActive = true
     var errorMessages: [Int: String] = [:]
     var selectReq: SelectLineRequest?    // diffed so updateNSView runs on inverse search / scroll-sync
     var scrollReq: SelectLineRequest?
@@ -1404,6 +1406,7 @@ struct LaTeXEditorView: NSViewRepresentable {
         guard let tv = scrollView.documentView as? LaTeXTextView else { return }
         context.coordinator.texLabClient = texLabClient   // keep in sync
         context.coordinator.compiler = compiler
+        scrollView.isHidden = !isActive
         tv.indentationWidth = max(1, tabWidth)
         let scaleChanged = context.coordinator.appliedFontScale != fontScale
         if scaleChanged || context.coordinator.appliedTabWidth != tabWidth {   // Settings changed font size / tab width
@@ -1433,7 +1436,10 @@ struct LaTeXEditorView: NSViewRepresentable {
         }
         tv.errorInfo = errorMessages      // light-red background + hover/⌘. message popover
         // SyncTeX inverse search (⌘-click): select the requested source line once per request.
-        if let req = compiler?.selectLineRequest, req.token != context.coordinator.lastSelectToken {
+        let isActiveDocument =
+            documentURL?.standardizedFileURL == compiler?.fileURL?.standardizedFileURL
+        if isActiveDocument, let req = compiler?.selectLineRequest,
+           req.token != context.coordinator.lastSelectToken {
             context.coordinator.lastSelectToken = req.token
             if let range = LaTeXEditorView.range(ofLine: req.line, in: tv.string) {
                 tv.setSelectedRange(range)
@@ -1442,14 +1448,15 @@ struct LaTeXEditorView: NSViewRepresentable {
             }
         }
         // Scroll-sync (PDF → editor): center the line without touching the selection.
-        if let req = compiler?.scrollToLineRequest, req.token != context.coordinator.lastScrollLineToken {
+        if isActiveDocument, let req = compiler?.scrollToLineRequest,
+           req.token != context.coordinator.lastScrollLineToken {
             context.coordinator.lastScrollLineToken = req.token
             compiler?.beginSyncCooldown()
             tv.centerLine(req.line)
         }
         // Quick-open content hit into a freshly-opened document: consume its parked jump once the
         // text is in place (take() removes it, so re-runs of updateNSView don't re-jump).
-        if let url = compiler?.fileURL, let line = PendingJump.shared.take(url) {
+        if let url = documentURL, let line = PendingJump.shared.take(url) {
             context.coordinator.performJump(to: line)
         }
         context.coordinator.bindFind(find)
@@ -1505,14 +1512,15 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     @MainActor @objc func handleJumpNotification(_ note: Notification) {
         guard let url = note.userInfo?["url"] as? URL,
               let line = note.userInfo?["line"] as? Int,
-              url.standardizedFileURL == compiler?.fileURL?.standardizedFileURL else { return }
+              url.standardizedFileURL == parent.documentURL?.standardizedFileURL else { return }
         _ = PendingJump.shared.take(url)   // clear the parked jump so it isn't consumed twice
         performJump(to: line)
     }
 
     // Scroll-sync (editor → PDF): center the PDF on the editor's center line, debounced.
     @MainActor @objc func editorScrolled() {
-        guard compiler?.scrollSyncEnabled == true, compiler?.inSyncCooldown == false else { return }
+        guard parent.documentURL?.standardizedFileURL == compiler?.fileURL?.standardizedFileURL,
+              compiler?.scrollSyncEnabled == true, compiler?.inSyncCooldown == false else { return }
         scrollWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, let hit = self.textView?.lineAtVisibleCenter() else { return }
@@ -1533,7 +1541,8 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     func textViewDidChangeSelection(_ notification: Notification) {
         guard let tv = notification.object as? NSTextView else { return }
         (tv as? LaTeXTextView)?.handleSelectionChange()
-        guard let compiler else { return }
+        guard parent.documentURL?.standardizedFileURL == compiler?.fileURL?.standardizedFileURL,
+              let compiler else { return }
         let ns = tv.string as NSString
         let loc = min(tv.selectedRange().location, ns.length)
         compiler.cursorLine = ns.substring(to: loc).components(separatedBy: "\n").count
@@ -1728,6 +1737,8 @@ struct LaTeXEditorView: UIViewRepresentable {
     @Binding var text: String
     var texLabClient: TexLabClient? = nil   // unused on iOS
     var compiler: LaTeXCompiler? = nil      // unused on iOS (no SyncTeX subprocess)
+    var documentURL: URL? = nil             // unused on iOS
+    var isActive = true                     // unused on iOS
     var errorMessages: [Int: String] = [:]  // unused on iOS
     var selectReq: SelectLineRequest? = nil
     var scrollReq: SelectLineRequest? = nil

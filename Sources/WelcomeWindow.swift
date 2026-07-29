@@ -15,11 +15,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
 }
 
-/// Welcome scene content: New / Open / recent files. Hosted by a SwiftUI `Window` scene so it shows
-/// natively at launch; document actions go through the standard DocumentGroup environment actions.
+enum WorkspaceLauncher {
+    static func newDocument(open: @escaping (ProjectLaunch) -> Void) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.latexSource]
+        panel.nameFieldStringValue = "Untitled.tex"
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try Data(defaultLaTeXSource.utf8).write(to: url, options: .atomic)
+                open(ProjectLaunch(fileURL: url))
+            } catch {
+                present(error: error)
+            }
+        }
+    }
+
+    static func openDocument(open: @escaping (ProjectLaunch) -> Void) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.latexSource, .plainText]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            open(ProjectLaunch(fileURL: url))
+        }
+    }
+
+    private static func present(error: Error) {
+        let alert = NSAlert(error: error)
+        alert.runModal()
+    }
+}
+
+/// Welcome scene content: New / Open / recent files. Each choice launches one project window;
+/// included sources subsequently open as internal editor tabs in that same window.
 struct WelcomeView: View {
-    @Environment(\.newDocument)   private var newDocument
-    @Environment(\.openDocument)  private var openDocument
+    @Environment(\.openWindow)    private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
 
     private var recents: [URL] { NSDocumentController.shared.recentDocumentURLs }
@@ -68,22 +99,25 @@ struct WelcomeView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 700, minHeight: 420)
+        .onOpenURL { open($0) }
     }
 
     private func newDoc() {
-        newDocument(LaTeXDocument())
-        dismissWindow()   // this welcome window (multiple may be open)
+        WorkspaceLauncher.newDocument { launch in
+            openWindow(value: launch)
+            dismissWindow()
+        }
     }
 
     private func open(_ url: URL) {
-        Task { try? await openDocument(at: url); dismissWindow() }
+        openWindow(value: ProjectLaunch(fileURL: url))
+        dismissWindow()
     }
 
     private func openPanel() {
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.latexSource, .plainText]
-        panel.begin { resp in
-            if resp == .OK, let url = panel.url { open(url) }
+        WorkspaceLauncher.openDocument { launch in
+            openWindow(value: launch)
+            dismissWindow()
         }
     }
 }

@@ -60,7 +60,14 @@ final class TexLabClient {
 
     func openDocument(url: URL, text: String) {
         guard isReady else { return }
-        currentURI = url.absoluteString
+        let nextURI = url.absoluteString
+        guard currentURI != nextURI else { return }
+        if !currentURI.isEmpty, currentURI != nextURI {
+            send(notification: "textDocument/didClose", params: [
+                "textDocument": ["uri": currentURI]
+            ])
+        }
+        currentURI = nextURI
         documentVersion = 1
         send(notification: "textDocument/didOpen", params: [
             "textDocument": ["uri": currentURI, "languageId": "latex", "version": 1, "text": text]

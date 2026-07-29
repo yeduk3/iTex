@@ -13,12 +13,20 @@ struct PDFPageHeights {
 
 struct PDFPreviewView: View {
     let compiler: LaTeXCompiler
+    /// A project editor-tab change can invalidate the surrounding SwiftUI layout even though the
+    /// PDF document did not change. Use this only to repaint the existing PDFView; never reload it.
+    var repaintToken: AnyHashable? = nil
 
     var body: some View {
         Group {
             if let url = compiler.pdfURL {
                 // Pass the forward-search request so SwiftUI re-runs updateNSView when it changes.
-                PDFKitRepresentable(url: url, compiler: compiler, forward: compiler.forwardHighlight)
+                PDFKitRepresentable(
+                    url: url,
+                    compiler: compiler,
+                    forward: compiler.forwardHighlight,
+                    repaintToken: repaintToken
+                )
             } else if compiler.previewState == .buildingDraft || compiler.isFinalBuilding {
                 ProgressView(compiler.isFinalBuilding ? "Final build…" : "Building draft…")
             } else if compiler.previewState == .failed {
@@ -46,6 +54,7 @@ private struct PDFKitRepresentable: NSViewRepresentable {
     let url: URL
     let compiler: LaTeXCompiler
     let forward: ForwardHighlight?   // diffed by SwiftUI so updateNSView fires on new forward searches
+    let repaintToken: AnyHashable?
 
     func makeCoordinator() -> Coordinator { Coordinator(compiler: compiler) }
 
@@ -68,6 +77,16 @@ private struct PDFKitRepresentable: NSViewRepresentable {
         coord.compiler = compiler
         coord.view = view
         coord.attachScrollObserver()   // idempotent; internal scroll view exists once laid out
+
+        // Changing only the editor tab must leave `view.document`, scale and scroll untouched.
+        // PDFKit can otherwise briefly expose its white backing view while the sibling editor's
+        // AppKit hierarchy changes. Synchronously repaint the already-loaded view hierarchy.
+        if coord.lastRepaintToken != repaintToken {
+            coord.lastRepaintToken = repaintToken
+            view.layoutDocumentView()
+            Self.markForDisplay(view)
+            view.displayIfNeeded()
+        }
 
         // Reload only on a new compile, preserving scroll + zoom (C7, docs/02).
         if coord.lastCompilationID != compiler.compilationID {
@@ -105,6 +124,7 @@ private struct PDFKitRepresentable: NSViewRepresentable {
         var compiler: LaTeXCompiler
         var lastCompilationID = -1
         var lastForwardToken = -1
+        var lastRepaintToken: AnyHashable?
         private var observing = false
         private var scrollWork: DispatchWorkItem?
 
@@ -191,6 +211,13 @@ private struct PDFKitRepresentable: NSViewRepresentable {
         }
     }
 
+    private static func markForDisplay(_ view: NSView) {
+        view.needsDisplay = true
+        for subview in view.subviews {
+            markForDisplay(subview)
+        }
+    }
+
     /// Preserve the in-page position proportionally when media-box dimensions change, then clamp.
     private static func restoredPoint(_ point: CGPoint, oldBounds: CGRect?, newBounds: CGRect) -> CGPoint {
         guard let old = oldBounds, old.width > 0, old.height > 0 else {
@@ -211,6 +238,7 @@ private struct PDFKitRepresentable: UIViewRepresentable {
     let url: URL
     let compiler: LaTeXCompiler
     let forward: ForwardHighlight?   // unused on iOS (no SyncTeX); keeps the shared call site uniform
+    let repaintToken: AnyHashable?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 

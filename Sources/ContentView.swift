@@ -406,7 +406,7 @@ import UniformTypeIdentifiers
 
 // MARK: - Embedded terminal
 
-private struct EmbeddedTerminalPanel: View {
+struct EmbeddedTerminalPanel: View {
     let directory: URL
     let isVisible: Bool
     @Binding var revision: Int
@@ -542,7 +542,7 @@ private struct WindowAccessor: NSViewRepresentable {
 
 /// Two panes with a draggable divider whose hit area is `handle`-wide (vs HSplitView's ~1px),
 /// so the boundary is easy to grab. `fraction` is the first pane's share, persisted by the caller.
-private struct DraggableSplit<First: View, Second: View>: View {
+struct DraggableSplit<First: View, Second: View>: View {
     let vertical: Bool
     @Binding var fraction: Double
     @ViewBuilder let first: () -> First
@@ -684,6 +684,9 @@ private struct FileEntry: Identifiable {
 struct SidebarView: View {
     let root: URL?
     let currentFile: URL?
+    var onOpen: (URL) -> Void = { url in
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+    }
     @StateObject private var tree = FileTreeModel()
     @State private var selection: URL?
     @State private var previewOn = false
@@ -749,7 +752,7 @@ struct SidebarView: View {
             refreshPreview()
         } else if FileEntry.openableExts.contains(ext),
                   url.standardizedFileURL != currentFile?.standardizedFileURL {
-            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+            onOpen(url)
         }
     }
 

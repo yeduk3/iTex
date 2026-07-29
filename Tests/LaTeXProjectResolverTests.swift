@@ -166,3 +166,91 @@ final class BuildDiagnosticParsingTests: XCTestCase {
         )
     }
 }
+
+@MainActor
+final class ProjectWorkspaceTests: XCTestCase {
+    private var temporaryDirectories: [URL] = []
+
+    override func tearDown() {
+        for url in temporaryDirectories { try? FileManager.default.removeItem(at: url) }
+        temporaryDirectories = []
+        super.tearDown()
+    }
+
+    func testOpeningAndSwitchingIncludedEditorsKeepsSharedPreviewGeneration() throws {
+        let root = try fixture([
+            "main.tex": "\\documentclass{article}\\begin{document}\\input{sections/child}\\end{document}",
+            "sections/child.tex": "Child"
+        ])
+        let main = root.appending(path: "main.tex")
+        let child = root.appending(path: "sections/child.tex")
+        let workspace = ProjectWorkspace(initialURL: main, tracksRecentDocuments: false)
+        let sharedCompiler = workspace.compiler
+        let initialGeneration = sharedCompiler.compilationID
+
+        workspace.openTab(child)
+
+        XCTAssertTrue(workspace.compiler === sharedCompiler)
+        XCTAssertEqual(workspace.tabs.count, 2)
+        XCTAssertEqual(workspace.activeFileURL, child.standardizedFileURL)
+        XCTAssertEqual(workspace.projectContext.mainFile, main.standardizedFileURL)
+        XCTAssertEqual(
+            sharedCompiler.compilationID,
+            initialGeneration,
+            "Selecting an editor tab must not compile or refresh the shared PDF viewer."
+        )
+
+        workspace.selectPreviousTab()
+        XCTAssertEqual(workspace.activeFileURL, main.standardizedFileURL)
+        XCTAssertEqual(sharedCompiler.compilationID, initialGeneration)
+    }
+
+    func testSaveAllWritesDirtyChildWithoutChangingProjectRoot() throws {
+        let root = try fixture([
+            "main.tex": "\\documentclass{article}\\begin{document}\\input{child}\\end{document}",
+            "child.tex": "Before"
+        ])
+        let main = root.appending(path: "main.tex")
+        let child = root.appending(path: "child.tex")
+        let workspace = ProjectWorkspace(initialURL: main, tracksRecentDocuments: false)
+        workspace.openTab(child)
+        workspace.activeTab?.source = "After"
+
+        try workspace.saveAll()
+
+        XCTAssertEqual(try String(contentsOf: child, encoding: .utf8), "After")
+        XCTAssertFalse(workspace.hasDirtyTabs)
+        XCTAssertEqual(workspace.projectContext.mainFile, main.standardizedFileURL)
+    }
+
+    func testNonTexEditorStaysInOwningProject() throws {
+        let root = try fixture([
+            "main.tex": "\\documentclass{article}\\begin{document}Hi\\end{document}",
+            "refs.bib": "@book{x,title={X}}"
+        ])
+        let main = root.appending(path: "main.tex")
+        let bibliography = root.appending(path: "refs.bib")
+        let workspace = ProjectWorkspace(initialURL: main, tracksRecentDocuments: false)
+
+        workspace.openTab(bibliography)
+
+        XCTAssertEqual(workspace.projectContext.mainFile, main.standardizedFileURL)
+        XCTAssertEqual(workspace.compiler.mainFileURL, main.standardizedFileURL)
+        XCTAssertEqual(workspace.compiler.fileURL, bibliography.standardizedFileURL)
+    }
+
+    private func fixture(_ files: [String: String]) throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "itex-workspace-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        temporaryDirectories.append(root)
+        for (relativePath, source) in files {
+            let file = root.appending(path: relativePath)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try source.write(to: file, atomically: true, encoding: .utf8)
+        }
+        return root.standardizedFileURL
+    }
+}
