@@ -20,9 +20,12 @@ struct iTexApp: App {
         .defaultPosition(.center)
         .commands {
             CommandGroup(replacing: .newItem) { WorkspaceFileCommands() }
-            CommandGroup(replacing: .saveItem) { WorkspaceSaveCommands() }
-            // File ▸ Open Project in Terminal, scoped to the focused saved document.
-            CommandGroup(after: .newItem) { OpenProjectInTerminalCommand() }
+            // A plain WindowGroup has no native `.saveItem` placement. Adding commands after
+            // `.newItem` keeps Save/Save All present in File for project workspace windows.
+            CommandGroup(after: .newItem) {
+                WorkspaceSaveCommands()
+                OpenProjectInTerminalCommand()
+            }
             // View ▸ font zoom (⌘+/⌘-/⌘0), applied live to every open editor.
             CommandGroup(after: .toolbar) { FontSizeCommands() }
             // View ▸ Show Problems (⇧⌘M), toggling the focused window's diagnostics panel.

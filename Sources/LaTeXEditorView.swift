@@ -1404,6 +1404,9 @@ struct LaTeXEditorView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let tv = scrollView.documentView as? LaTeXTextView else { return }
+        // NSViewRepresentable coordinators outlive individual SwiftUI value snapshots. Refresh
+        // the parent so textDidChange always writes through the current tab's Binding.
+        context.coordinator.parent = self
         context.coordinator.texLabClient = texLabClient   // keep in sync
         context.coordinator.compiler = compiler
         scrollView.isHidden = !isActive
