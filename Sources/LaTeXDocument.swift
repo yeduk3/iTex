@@ -11,12 +11,15 @@ extension Notification.Name {
 }
 
 struct LaTeXDocument: FileDocument {
+    /// Survives value-type document updates and scopes save notifications to one window.
+    let id: UUID
     var source: String
 
     static var readableContentTypes: [UTType] { [.latexSource, .plainText] }
     static var writableContentTypes: [UTType] { [.latexSource] }
 
     init(source: String = defaultSource) {
+        id = UUID()
         self.source = source
     }
 
@@ -24,13 +27,19 @@ struct LaTeXDocument: FileDocument {
         guard let data = configuration.file.regularFileContents,
               let string = String(data: data, encoding: .utf8)
         else { throw CocoaError(.fileReadCorruptFile) }
+        id = UUID()
         source = string
     }
 
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
         let data = Data(source.utf8)
         // Compile-on-save: notify on the main actor (writing happens off-main).
-        DispatchQueue.main.async { NotificationCenter.default.post(name: .iTexDidSave, object: nil) }
+        let documentID = id
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: .iTexDidSave, object: nil, userInfo: ["documentID": documentID]
+            )
+        }
         return FileWrapper(regularFileWithContents: data)
     }
 }

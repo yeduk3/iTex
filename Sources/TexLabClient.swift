@@ -93,6 +93,16 @@ final class TexLabClient {
         process?.terminate()
         process = nil
         writer  = nil
+        buffer.removeAll()
+        initialized = false
+        isReady = false
+        currentURI = ""
+        documentVersion = 1
+        latestCompletions = []
+        for continuation in pendingCompletions.values {
+            continuation.resume(returning: [])
+        }
+        pendingCompletions.removeAll()
     }
 
     // MARK: - Send helpers

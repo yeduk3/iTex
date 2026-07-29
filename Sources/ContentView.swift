@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var linter        = ChkTexLinter()
     @State private var texLabClient  = TexLabClient()
     @State private var shortcuts     = ShortcutStore.shared
+    @State private var projectContext: LaTeXProjectContext?
     @StateObject private var diagnostics = DiagnosticsStore()
     @State private var showProblems  = false
     @State private var showCompileRestartConfirmation = false
@@ -40,8 +41,13 @@ struct ContentView: View {
                 Text("A compilation is still running. Stop it and start a clean build from the beginning?")
             }
             .task {
-                compiler.fileURL = fileURL
+                configureProject()
                 texLabClient.onDiagnostics = { diagnostics.setLSP($0) }
+#if os(macOS)
+                compiler.onNavigateToSource = { url, line in
+                    openProjectFile(url, line: line)
+                }
+#endif
                 linter.onResults = { warnings in
                     diagnostics.setChkTex(warnings.map {
                         Diagnostic(source: .chktex, severity: $0.isError ? .error : .warning,
@@ -51,15 +57,7 @@ struct ContentView: View {
 
                 // Start texlab LSP if file is saved
                 if let url = fileURL {
-                    texLabClient.start(workspaceURL: url.deletingLastPathComponent())
-                    // Poll for ready (max 3s) then open document
-                    for _ in 0..<30 {
-                        if texLabClient.isReady { break }
-                        try? await Task.sleep(for: .milliseconds(100))
-                    }
-                    if texLabClient.isReady {
-                        texLabClient.openDocument(url: url, text: document.source)
-                    }
+                    await startTexLab(for: url)
                 }
 
                 await compiler.compile(source: document.source)
@@ -67,17 +65,25 @@ struct ContentView: View {
             }
             .onChange(of: fileURL) { _, url in
                 compiler.fileURL = url
-            }
-            .onChange(of: compiler.errorMessages) { _, msgs in
-                let diags = msgs.map {
-                    Diagnostic(source: .build, severity: .error, file: fileURL, line: $0.key, message: $0.value)
+                configureProject()
+                if let url {
+                    Task { await startTexLab(for: url) }
                 }
+            }
+            .onChange(of: compiler.buildDiagnostics) { _, diags in
                 diagnostics.setBuild(diags)
                 if !diags.isEmpty { showProblems = true }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .iTexDidSave)) { _ in
+            .onReceive(NotificationCenter.default.publisher(for: .iTexDidSave)) { notification in
+                guard notification.userInfo?["documentID"] as? UUID == document.id else { return }
                 // Compile-on-save (replaces per-keystroke compile).
-                Task { await compiler.compile(source: document.source, profile: .fastPreview) }
+                Task {
+                    // FileDocument posts while producing the wrapper; let the coordinated disk
+                    // write finish before a parent document reads this included child.
+                    try? await Task.sleep(for: .milliseconds(100))
+                    configureProject()
+                    await compiler.compile(source: document.source, profile: .fastPreview)
+                }
                 if let url = fileURL { Task { await linter.lint(fileURL: url) } }
             }
             .onDisappear {
@@ -95,7 +101,7 @@ struct ContentView: View {
         // sidebar and animates reveal/collapse natively — we keep it as the single button.
         // ⌘\ drives the same animated toggle via a hidden shortcut (no second visible button).
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(root: fileURL?.deletingLastPathComponent(), currentFile: fileURL)
+            SidebarView(root: projectDirectory, currentFile: fileURL)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 360)
         } detail: {
             VStack(spacing: 0) {
@@ -121,7 +127,8 @@ struct ContentView: View {
                 .keyboardShortcut(shortcuts.combo(.toggleSidebar).keyboardShortcut)
                 .opacity(0).frame(width: 0, height: 0).accessibilityHidden(true)
         }
-        .background(WindowAccessor(rootKey: fileURL?.deletingLastPathComponent().standardizedFileURL.path ?? "none"))
+        .background(WindowAccessor(rootKey: projectDirectory?.standardizedFileURL.path ?? "none")
+            .id(projectDirectory?.standardizedFileURL.path ?? "none"))
         .onAppear { columnVisibility = showSidebar ? .all : .doubleColumn }
         .onChange(of: columnVisibility) { _, v in
             showSidebar = (v != .detailOnly)
@@ -131,9 +138,9 @@ struct ContentView: View {
                                     set: { if !$0 { quickOpen.hide() } })) {
             QuickOpenPalette(controller: quickOpen, onOpen: handleQuickOpen)
         }
-        .focusedSceneValue(\.quickOpenAction, { quickOpen.show(root: fileURL?.deletingLastPathComponent()) })
+        .focusedSceneValue(\.quickOpenAction, { quickOpen.show(root: projectDirectory) })
         .focusedSceneValue(\.problemsToggle, { showProblems.toggle() })
-        .focusedSceneValue(\.projectDirectory, fileURL?.deletingLastPathComponent())
+        .focusedSceneValue(\.projectDirectory, projectDirectory)
         .focusedSceneValue(\.embeddedTerminalToggle, terminalToggleAction)
 #else
         HStack(spacing: 0) {
@@ -145,9 +152,35 @@ struct ContentView: View {
 #endif
     }
 
-#if os(macOS)
-    private var projectDirectory: URL? { fileURL?.deletingLastPathComponent() }
+    private var projectDirectory: URL? {
+        projectContext?.projectDirectory ?? fileURL?.deletingLastPathComponent()
+    }
 
+    private func configureProject() {
+        guard let fileURL else {
+            projectContext = nil
+            compiler.fileURL = nil
+            compiler.configureProject(nil)
+            return
+        }
+        let resolved = LaTeXProjectResolver.resolve(fileURL)
+        projectContext = resolved
+        compiler.configureProject(resolved)
+    }
+
+    private func startTexLab(for url: URL) async {
+        texLabClient.stop()
+        texLabClient.start(workspaceURL: projectDirectory ?? url.deletingLastPathComponent())
+        for _ in 0..<30 {
+            if texLabClient.isReady { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if texLabClient.isReady {
+            texLabClient.openDocument(url: url, text: document.source)
+        }
+    }
+
+#if os(macOS)
     private var terminalToggleAction: (() -> Void)? {
         guard projectDirectory != nil else { return nil }
         return toggleTerminalPanel
@@ -228,6 +261,14 @@ struct ContentView: View {
             NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
         } else {
             NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    private func openProjectFile(_ url: URL, line: Int) {
+        PendingJump.shared.set(url, line: line)
+        NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in
+            NotificationCenter.default.post(name: .iTexJumpToLine, object: nil,
+                                            userInfo: ["url": url, "line": line])
         }
     }
 

@@ -23,7 +23,7 @@ enum DiagnosticSeverity: Int {
     }
 }
 
-struct Diagnostic: Identifiable {
+struct Diagnostic: Identifiable, Equatable {
     let id = UUID()
     let source: DiagnosticSource
     let severity: DiagnosticSeverity
