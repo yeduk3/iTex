@@ -518,26 +518,11 @@ final class LaTeXTextView: NSTextView {
         }
     }
 
-    /// ⌘⇧E: move first-responder focus between the editor and the file sidebar's outline view.
-    /// performKeyEquivalent is dispatched window-wide (down the view tree, not the responder chain),
-    /// so this fires no matter which pane has focus. AppKit-level because SwiftUI @FocusState
-    /// cannot reliably *set* focus on a macOS 14 List.
-    /// ponytail: firstDescendant picks the first NSTableView in the window — the sidebar, since the
-    /// leading NavigationSplitView column precedes the problems panel in the view tree. If another
-    /// table ever wins, scope the search to the split view's leading pane.
+    /// ⌘⇧E: move first-responder focus between the editor and this window's registered sidebar.
+    /// The registry owns a weak reference to the actual NSOutlineView, so completion/results
+    /// tables elsewhere in the window can never become the focus target.
     private func toggleSidebarFocus() {
-        guard let win = window, let content = win.contentView,
-              let outline = Self.firstDescendant(of: content, where: { $0 is NSTableView })
-        else { return }
-        let fr = win.firstResponder as? NSView
-        let inSidebar = fr != nil && (fr === outline || fr!.isDescendant(of: outline))
-        win.makeFirstResponder(inSidebar ? self : outline)
-    }
-
-    static func firstDescendant(of root: NSView, where pred: (NSView) -> Bool) -> NSView? {
-        if pred(root) { return root }
-        for sub in root.subviews { if let f = firstDescendant(of: sub, where: pred) { return f } }
-        return nil
+        SidebarFocusController.shared.toggle(from: self)
     }
 
     // Tab: indent selection / wrap `\env` in begin-end / insert 2 spaces

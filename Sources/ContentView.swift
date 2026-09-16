@@ -681,7 +681,7 @@ private struct FileEntry: Identifiable {
 
 /// Left sidebar: native `.sidebar` file tree rooted at the open .tex file's directory.
 /// Folder name is the section header; selecting an image row previews it (same popover style).
-struct SidebarView: View {
+private struct LegacySidebarView: View {
     let root: URL?
     let currentFile: URL?
     var onOpen: (URL) -> Void = { url in
@@ -763,7 +763,11 @@ struct SidebarView: View {
               FileEntry.imageExts.contains(url.pathExtension.lowercased()) else {
             SidebarPreviewPanel.shared.hide(); return
         }
-        SidebarPreviewPanel.shared.show(url: url, in: NSApp.keyWindow)
+        guard let outline = SidebarFocusController.shared.outline(in: NSApp.keyWindow) else {
+            SidebarPreviewPanel.shared.hide()
+            return
+        }
+        SidebarPreviewPanel.shared.show(url: url, anchoredTo: outline)
     }
 
     @ViewBuilder private func contextMenuItems(for url: URL) -> some View {
@@ -960,8 +964,8 @@ private enum SidebarFileOps {
 // MARK: - Sidebar image/PDF preview panel
 
 /// Quick Look-style preview for the sidebar's selected image/PDF, toggled with Space.
-/// A non-activating child panel (never key — the List keeps keyboard focus, unlike an
-/// NSPopover/.popover which steals it) anchored beside the selected row.
+/// A non-activating child panel (never key, so the outline keeps keyboard focus) anchored
+/// beside the selected row.
 /// ponytail: anchored at show-time row rect — scrolling the list doesn't move it; it re-anchors
 /// on the next selection change. Track scroll notifications if that ever matters.
 @MainActor
@@ -969,14 +973,17 @@ final class SidebarPreviewPanel {
     static let shared = SidebarPreviewPanel()
     private var panel: NSPanel?
 
-    func show(url: URL, in window: NSWindow?) {
-        guard let window, let img = NSImage(contentsOf: url),
-              let table = (window.firstResponder as? NSTableView)
-                ?? firstTable(in: window.contentView), table.selectedRow >= 0
+    func show(url: URL, anchoredTo outlineView: NSOutlineView) {
+        guard let window = outlineView.window,
+              let img = NSImage(contentsOf: url),
+              outlineView.selectedRow >= 0
         else { hide(); return }
 
         // Selected row's frame in screen coords; panel sits to its right.
-        let rowInWindow = table.convert(table.rect(ofRow: table.selectedRow), to: nil)
+        let rowInWindow = outlineView.convert(
+            outlineView.rect(ofRow: outlineView.selectedRow),
+            to: nil
+        )
         let rowOnScreen = window.convertToScreen(rowInWindow)
 
         let maxDim: CGFloat = 360
@@ -1014,13 +1021,6 @@ final class SidebarPreviewPanel {
         p.contentView = iv
         panel = p
         return p
-    }
-
-    private func firstTable(in root: NSView?) -> NSTableView? {
-        guard let root else { return nil }
-        if let t = root as? NSTableView { return t }
-        for sub in root.subviews { if let t = firstTable(in: sub) { return t } }
-        return nil
     }
 }
 #endif
