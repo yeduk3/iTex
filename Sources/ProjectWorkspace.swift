@@ -33,6 +33,14 @@ final class WorkspaceEditorTab: Identifiable {
 
     var isDirty: Bool { source != savedSource }
     func markSaved() { savedSource = source }
+    /// External edit accepted: buffer and baseline both become the disk content.
+    func reload(from disk: String) {
+        source = disk
+        savedSource = disk
+    }
+    /// External edit declined: keep the buffer (still dirty) against the new disk baseline, so a
+    /// later save overwrites the file intentionally.
+    func keepBuffer(over disk: String) { savedSource = disk }
 }
 
 /// One project window owns this object. The compiler, LSP and PDF URL live here—not in an
@@ -50,8 +58,36 @@ final class ProjectWorkspace {
     let texLabClient = TexLabClient()
     let diagnostics = DiagnosticsStore()
 
+    /// A dirty editor's file changed on disk: true reloads from disk, false keeps the buffer.
+    /// Injectable so tests answer without a modal alert.
+    @ObservationIgnored
+    var resolveExternalConflict: @MainActor (WorkspaceEditorTab) -> Bool = { tab in
+        let alert = NSAlert()
+        alert.messageText = "\(tab.url.lastPathComponent) changed on disk"
+        alert.informativeText = "Reloading discards your unsaved edits. Keeping them leaves the editor unsaved; saving then overwrites the file."
+        alert.addButton(withTitle: "Reload from Disk")
+        alert.addButton(withTitle: "Keep My Changes")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// The preview rebuild an external edit triggers. Injectable so tests observe coalescing
+    /// without running TeX.
+    @ObservationIgnored
+    var rebuildPreview: @MainActor (ProjectWorkspace) async -> Void = { await $0.compileActive() }
+
+    /// Closing the window or quitting with these dirty editors. Injectable so tests answer
+    /// without a modal alert (see WorkspaceClosePrompt.swift).
+    @ObservationIgnored
+    var resolveUnsavedChanges: @MainActor ([WorkspaceEditorTab]) -> UnsavedChangesChoice = UnsavedChangesAlert.run
+
     private var started = false
     private let tracksRecentDocuments: Bool
+    @ObservationIgnored private var previewRebuildPending = false
+    @ObservationIgnored private var isRebuildingPreview = false
+    @ObservationIgnored private var projectWatcher: FileTreeDirectoryWatcher?
+    @ObservationIgnored private var pendingExternalChanges: [URL] = []
+    @ObservationIgnored private var isReconcilingExternalChanges = false
+    private static let projectSourceExtensions: Set<String> = ["tex", "bib", "sty", "cls"]
 
     init(initialURL: URL, tracksRecentDocuments: Bool = true) {
         self.tracksRecentDocuments = tracksRecentDocuments
@@ -94,6 +130,7 @@ final class ProjectWorkspace {
     func start() async {
         guard !started else { return }
         started = true
+        startWatchingProject()
 
         compiler.onNavigateToSource = { [weak self] url, line in
             self?.openTab(url, line: line)
@@ -187,13 +224,19 @@ final class ProjectWorkspace {
         guard let activeTab else { return }
         do {
             try save(activeTab)
-            refreshProjectContext()
-            compiler.configureProject(context(for: activeTab.url))
-            await compiler.compile(source: activeTab.source, profile: .fastPreview)
-            await linter.lint(fileURL: activeTab.url)
+            await compileActive()
         } catch {
             lastError = "Could not save \(activeTab.url.lastPathComponent): \(error.localizedDescription)"
         }
+    }
+
+    /// Preview rebuild from the editors as they are; callers own saving.
+    private func compileActive() async {
+        guard let activeTab else { return }
+        refreshProjectContext()
+        compiler.configureProject(context(for: activeTab.url))
+        await compiler.compile(source: activeTab.source, profile: .fastPreview)
+        await linter.lint(fileURL: activeTab.url)
     }
 
     func saveAll() throws {
@@ -274,8 +317,102 @@ final class ProjectWorkspace {
     }
 
     func shutdown() {
+        projectWatcher?.stop()
+        projectWatcher = nil
         texLabClient.stop()
         Task { await compiler.shutdownWarm() }
+    }
+
+    // MARK: - External edits
+
+    /// Reconcile open editors with files changed outside iTex (e.g. an agent in the embedded
+    /// terminal). Returns true when the preview should rebuild: an editor reloaded, or an unopened
+    /// project source changed. Our own saves already match the buffer and change nothing.
+    @discardableResult
+    func handleExternalChanges(_ urls: [URL]) -> Bool {
+        pendingExternalChanges.append(contentsOf: urls)
+        // The conflict alert spins a modal run loop that still delivers FSEvents; fold those into
+        // this pass instead of stacking a second alert.
+        guard !isReconcilingExternalChanges else { return false }
+        isReconcilingExternalChanges = true
+        defer { isReconcilingExternalChanges = false }
+
+        var needsPreview = false
+        while !pendingExternalChanges.isEmpty {
+            let batch = pendingExternalChanges
+            pendingExternalChanges.removeAll()
+            let changed = Set(batch.map(Self.canonicalPath))
+            var openPaths = Set<String>()
+            for tab in tabs {
+                let path = Self.canonicalPath(tab.url)
+                openPaths.insert(path)
+                guard changed.contains(path), let disk = try? Self.read(tab.url) else { continue }
+                if disk == tab.source { tab.markSaved(); continue }   // own save / already in sync
+                if disk == tab.savedSource { continue }               // touch or repeated event
+                if tab.isDirty {
+                    let reload = resolveExternalConflict(tab)
+                    // The agent may have written again while the alert was up; decide on the latest.
+                    let latest = (try? Self.read(tab.url)) ?? disk
+                    guard reload else { tab.keepBuffer(over: latest); continue }
+                    tab.reload(from: latest)
+                } else {
+                    tab.reload(from: disk)
+                }
+                needsPreview = true
+            }
+            // Included files an agent edits are often not open. Build outputs (the exported PDF and
+            // its temp) fail the extension filter, so a compile cannot retrigger itself.
+            if !needsPreview {
+                let baselines = Set(tabs.map(\.savedSource))
+                needsPreview = batch.contains { url in
+                    Self.projectSourceExtensions.contains(url.pathExtension.lowercased())
+                        && !openPaths.contains(Self.canonicalPath(url))
+                        && (try? Self.read(url)).map { !baselines.contains($0) } == true
+                }
+            }
+        }
+        return needsPreview
+    }
+
+    private func startWatchingProject() {
+        let root = Self.canonicalPath(projectDirectory)
+        let scratch = Self.canonicalPath(FileManager.default.temporaryDirectory)
+        // Compile scratch (.tex build copies, symlink mirrors) lives under $TMPDIR; a project folder
+        // enclosing it would read every compile as an external edit and recompile forever.
+        guard !(scratch + "/").hasPrefix(root.hasSuffix("/") ? root : root + "/") else { return }
+        // ponytail: watches the project folder only; editors opened from outside it (e.g. SyncTeX
+        // into a system .sty) don't pick up external edits.
+        let watcher = FileTreeDirectoryWatcher { [weak self] urls in
+            guard let self, self.handleExternalChanges(urls) else { return }
+            self.schedulePreviewRebuild()
+        }
+        watcher.start(url: projectDirectory)
+        projectWatcher = watcher
+    }
+
+    /// Trailing rebuild for an external edit burst. `compile` drops requests while a build runs, so
+    /// a single pending waiter holds until the compiler (and our previous rebuild) is free, then
+    /// builds the current state. A change during that build schedules the next waiter, so the
+    /// burst's final disk state is always previewed.
+    func schedulePreviewRebuild() {
+        guard !previewRebuildPending else { return }
+        previewRebuildPending = true
+        Task { [weak self] in
+            // ponytail: 100 ms poll; a compile-finished continuation would avoid the wake-ups.
+            while let self, !self.compiler.acceptsCompileRequest || self.isRebuildingPreview {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard let self else { return }
+            self.previewRebuildPending = false
+            self.isRebuildingPreview = true
+            await self.rebuildPreview(self)
+            self.isRebuildingPreview = false
+        }
+    }
+
+    /// FSEvents reports real paths (/private/var…, resolved folder links); tabs keep the opened path.
+    private static func canonicalPath(_ url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     private func save(_ tab: WorkspaceEditorTab) throws {
@@ -372,6 +509,7 @@ struct ProjectWorkspaceView: View {
         }
         .background(
             WorkspaceWindowAccessor(
+                workspace: workspace,
                 title: workspace.windowTitle,
                 representedURL: workspace.activeFileURL,
                 isDocumentEdited: workspace.hasDirtyTabs
@@ -578,6 +716,12 @@ struct ProjectWorkspaceView: View {
             .foregroundStyle(workspace.compiler.scrollSyncEnabled ? Color.accentColor : Color.primary)
         }
         ToolbarItem(placement: .automatic) {
+            Button { verticalSplit.toggle() } label: {
+                Label("Layout", systemImage: verticalSplit ? "rectangle.split.1x2" : "rectangle.split.2x1")
+            }
+            .help(verticalSplit ? "Place the preview beside the editor" : "Place the preview below the editor")
+        }
+        ToolbarItem(placement: .automatic) {
             Button(action: requestFinalBuild) {
                 if workspace.compiler.isCompiling {
                     HStack(spacing: 5) {
@@ -628,7 +772,7 @@ struct ProjectWorkspaceView: View {
     }
 }
 
-private struct WorkspaceEditors: View {
+struct WorkspaceEditors: View {
     let workspace: ProjectWorkspace
 
     var body: some View {
@@ -720,6 +864,7 @@ private struct EditorTabStrip: View {
 }
 
 private struct WorkspaceWindowAccessor: NSViewRepresentable {
+    let workspace: ProjectWorkspace
     let title: String
     let representedURL: URL?
     let isDocumentEdited: Bool
@@ -733,6 +878,9 @@ private struct WorkspaceWindowAccessor: NSViewRepresentable {
             window.representedURL = representedURL
             window.isDocumentEdited = isDocumentEdited
             window.tabbingMode = .disallowed
+            // Every update (a tab turning dirty is one) re-checks that the close guard fronts
+            // SwiftUI's delegate.
+            WorkspaceWindowCloseGuard.install(on: window, workspace: workspace)
         }
     }
 }

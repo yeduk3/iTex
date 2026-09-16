@@ -4,8 +4,8 @@ import AppKit
 import UniformTypeIdentifiers
 
 /// Launch experience: the welcome window is the app's FIRST scene (see iTexApp.body), so a plain
-/// launch lands here with no untitled document flashing. This delegate only stops NSDocumentController
-/// from auto-opening an untitled file on launch / reopen.
+/// launch lands here with no untitled document flashing. This delegate stops NSDocumentController
+/// from auto-opening an untitled file on launch / reopen, and gates quit on unsaved project editors.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillFinishLaunching(_ notification: Notification) {
         // Never restore the previous session's document windows — a plain launch shows welcome only.
@@ -13,6 +13,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
+
+    /// ⌘Q with unsaved editors: each project window asks once; any Cancel keeps the app running.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        WorkspaceWindowCloseGuard.terminateReply(for: WorkspaceWindowCloseGuard.live)
+    }
 }
 
 enum WorkspaceLauncher {

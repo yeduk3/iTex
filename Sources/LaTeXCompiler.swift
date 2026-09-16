@@ -41,6 +41,9 @@ final class LaTeXCompiler {
     /// A clean restart has already been accepted and is stopping/cleaning before its replacement
     /// compile starts. Repeated UI commands during this short phase are idempotent.
     var restartInProgress: Bool { isRestarting }
+    /// Exactly the condition under which `compile` runs instead of dropping the request. Unlike
+    /// `isCompiling`, an image-enhancement pass doesn't block (a new compile supersedes it).
+    var acceptsCompileRequest: Bool { activeCompileTask == nil && !isRestarting }
     var errorMessage: String?
     var imagePreviewError: String?
     var errorMessages: [Int: String] = [:]   // 1-based source line → error text, from last failed build

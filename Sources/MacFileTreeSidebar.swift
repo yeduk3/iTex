@@ -354,7 +354,9 @@ final class SidebarFocusController {
 
 // MARK: - FSEvents
 
-private final class FileTreeDirectoryWatcher {
+/// Debounced recursive FSEvents watcher (file-level paths, main queue). Shared by the file tree
+/// and ProjectWorkspace's external-edit reload.
+final class FileTreeDirectoryWatcher {
     private var stream: FSEventStreamRef?
     private var watchedPath: String?
     private let onChange: ([URL]) -> Void

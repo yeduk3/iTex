@@ -1028,6 +1028,31 @@ final class LaTeXTextView: NSTextView {
         return location + delta
     }
 
+    /// Replace the buffer with `text` by editing only the span between the common UTF-16 prefix and
+    /// suffix, as its own undo step. Caret and scroll outside that span survive. Returns the
+    /// replaced range in the new text, or nil when the edit was refused.
+    @discardableResult
+    func replaceChangedRange(with text: String) -> NSRange? {
+        let old = Array(string.utf16), new = Array(text.utf16)
+        let common = min(old.count, new.count)
+        var prefix = 0
+        while prefix < common, old[prefix] == new[prefix] { prefix += 1 }
+        var suffix = 0
+        while suffix < common - prefix, old[old.count - 1 - suffix] == new[new.count - 1 - suffix] { suffix += 1 }
+        // Never split a surrogate pair at either edge.
+        if prefix > 0, UTF16.isLeadSurrogate(old[prefix - 1]) { prefix -= 1 }
+        if suffix > 0, UTF16.isTrailSurrogate(old[old.count - suffix]) { suffix -= 1 }
+        let range = NSRange(location: prefix, length: old.count - prefix - suffix)
+        let replacement = (text as NSString)
+            .substring(with: NSRange(location: prefix, length: new.count - prefix - suffix))
+        breakUndoCoalescing()   // don't fold into the user's last typing step
+        guard shouldChangeText(in: range, replacementString: replacement) else { return nil }
+        textStorage?.replaceCharacters(in: range, with: NSAttributedString(string: replacement,
+                                                                           attributes: typingAttributes))
+        didChangeText()
+        return NSRange(location: prefix, length: (replacement as NSString).length)
+    }
+
     @discardableResult
     private func replace(range: NSRange, with str: String, newSelection: NSRange) -> Bool {
         guard shouldChangeText(in: range, replacementString: str) else { return false }
@@ -1412,15 +1437,13 @@ struct LaTeXEditorView: NSViewRepresentable {
             context.coordinator.lineRuler?.refresh()
         }
         if tv.string != text {
-            tv.endSnippetSession()   // outside edit replaced the buffer → any session's ranges are void
-            tv.string = text
-            if let style = context.coordinator.tabStyle {   // string setter drops paragraph style; reapply
-                tv.textStorage?.addAttribute(.paragraphStyle, value: style,
-                    range: NSRange(location: 0, length: (text as NSString).length))
+            if tv.hasMarkedText() {
+                // IME composing: editing under marked text corrupts the input session. Defer;
+                // textDidChange resyncs from the binding once the composition ends.
+                context.coordinator.syncAfterComposition = true
+            } else {
+                context.coordinator.applyBindingText(text, to: tv)
             }
-            tv.refreshStructureHighlighting()
-            context.coordinator.findMatchesStale = true   // ranges shifted → recompute find on next pass
-            context.coordinator.lineRuler?.refresh()      // direct string set posts no didChange notification
         }
         tv.errorInfo = errorMessages      // light-red background + hover/⌘. message popover
         // SyncTeX inverse search (⌘-click): select the requested source line once per request.
@@ -1466,6 +1489,10 @@ final class Coordinator: NSObject, NSTextViewDelegate {
     var appliedFontScale = -1.0
     weak var lineRuler: LineNumberRuler?
     private var scrollWork: DispatchWorkItem?
+    /// Set while binding text is pushed into the view, so its didChangeText doesn't echo back.
+    private var isApplyingBindingText = false
+    /// The binding changed during IME composition; apply it once the composition ends.
+    var syncAfterComposition = false
 
     // Find/replace state (single source of truth is the FindController; these mirror it for logic).
     var find: FindController?
@@ -1518,8 +1545,33 @@ final class Coordinator: NSObject, NSTextViewDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)
     }
 
+    /// Push an outside buffer change (e.g. external reload) into the view as a minimal, undoable
+    /// edit instead of a whole-string set that resets caret, scroll, and undo.
+    func applyBindingText(_ text: String, to tv: LaTeXTextView) {
+        syncAfterComposition = false
+        tv.endSnippetSession()   // outside edit replaced the buffer → any session's ranges are void
+        isApplyingBindingText = true
+        let replaced = tv.replaceChangedRange(with: text)
+        isApplyingBindingText = false
+        if replaced == nil { tv.string = text }   // edit refused → hard set
+        if let style = tabStyle {   // replaced text may lack the tab paragraph style; reapply
+            tv.textStorage?.addAttribute(.paragraphStyle, value: style,
+                range: replaced ?? NSRange(location: 0, length: (text as NSString).length))
+        }
+        tv.refreshStructureHighlighting()
+        findMatchesStale = true   // ranges shifted → recompute find on next pass
+        lineRuler?.refresh()      // the hard-set fallback posts no didChange notification
+    }
+
     func textDidChange(_ notification: Notification) {
-        guard let tv = notification.object as? NSTextView else { return }
+        guard !isApplyingBindingText, let tv = notification.object as? NSTextView else { return }
+        if syncAfterComposition, let latex = tv as? LaTeXTextView {
+            // Don't echo the stale buffer (plus marked text) over the newer binding. When the
+            // composition ends the binding wins. ponytail: the just-committed syllable is dropped.
+            guard !tv.hasMarkedText() else { return }
+            applyBindingText(parent.text, to: latex)
+            return
+        }
         parent.text = tv.string
         (tv as? LaTeXTextView)?.refreshStructureHighlighting()
         findMatchesStale = true   // ranges shifted; recompute on the next applyFind pass

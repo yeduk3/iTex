@@ -557,18 +557,13 @@ struct DraggableSplit<First: View, Second: View>: View {
             let total = vertical ? geo.size.height : geo.size.width
             let f = min(max(fraction, minFrac), 1 - minFrac)
             let firstLen = total * f
-            if vertical {
-                VStack(spacing: 0) {
-                    first().frame(height: firstLen)
-                    divider(total: total)
-                    second()
-                }
-            } else {
-                HStack(spacing: 0) {
-                    first().frame(width: firstLen)
-                    divider(total: total)
-                    second()
-                }
+            // One container for both orientations: an if/else would rebuild both panes on a
+            // toggle (editor undo/caret/scroll, the PDF view).
+            let layout = vertical ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+            layout {
+                first().frame(width: vertical ? nil : firstLen, height: vertical ? firstLen : nil)
+                divider(total: total)
+                second()
             }
         }
     }
